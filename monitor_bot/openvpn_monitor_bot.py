@@ -10,8 +10,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 )
 
-TOKEN = "токен телеграм бота"
-ADMIN_ID = id телеграм
+from config import TOKEN, ADMIN_ID
 
 KEYS_DIR = "/root"
 OPENVPN_DIR = "/etc/openvpn"
