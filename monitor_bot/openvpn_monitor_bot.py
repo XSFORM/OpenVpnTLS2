@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from add_server_conversation import add_server_conv
+from add_client_conversation import create_key_conv
 import os
 import subprocess
 from datetime import date, datetime
@@ -109,9 +111,11 @@ def format_tm_time(dt_str):
 
 def get_main_keyboard():
     keyboard = [
+        [InlineKeyboardButton("➕ Добавить сервер", callback_data='add_server')],
+        [InlineKeyboardButton("🗝️ Создать ключ", callback_data='create_key')],
         [InlineKeyboardButton("🔄 Обновить список", callback_data='refresh')],
-        [InlineKeyboardButton("📊 Статистика", callback_data='stats'),
-         InlineKeyboardButton("🟢 Онлайн клиенты", callback_data='online')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='stats')],
+        [InlineKeyboardButton("🟢 Онлайн клиенты", callback_data='online')],
         [InlineKeyboardButton("✅ Включить клиента", callback_data='enable')],
         [InlineKeyboardButton("⚠️ Отключить клиента", callback_data='disable')],
         [InlineKeyboardButton("📜 Просмотр лога", callback_data='log')],
@@ -657,6 +661,9 @@ def main():
     app.add_handler(CallbackQueryHandler(restore_confirm_handler, pattern='^restore_confirm$'))
     app.add_handler(CallbackQueryHandler(restore_cancel_handler, pattern='^restore_cancel$'))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    app.bot_data['ADMIN_ID'] = ADMIN_ID  # Чтобы передавать ADMIN_ID в диалог
+    app.add_handler(add_server_conv)
+    app.add_handler(create_key_conv)
     import asyncio
     loop = asyncio.get_event_loop()
     loop.create_task(check_new_connections(app))
