@@ -10,8 +10,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 )
 
-TOKEN = "7785992322:AAGrqqjQdUfWAOnDaWK_u1L3IXXzRR-ipDw"
-ADMIN_ID = 1214218746
+from config import TOKEN, ADMIN_ID
 
 KEYS_DIR = "/root"
 OPENVPN_DIR = "/etc/openvpn"
