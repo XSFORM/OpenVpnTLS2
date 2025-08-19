@@ -1,4 +1,4 @@
-# openvpn-xormask
+# OpenVpnTLS2
 
 ## Быстрый старт: OpenVPN-сервер + Telegram-монитор-бот
 
@@ -10,13 +10,13 @@
 
 1. **Клонируйте репозиторий:**
    ```bash
-   git clone https://github.com/XSFORM/openvpn-xormask.git
-   cd openvpn-xormask
+   git clone https://github.com/XSFORM/OpenVpnTLS2.git
+   cd OpenVpnTLS2
    ```
 
 2. **Дайте права на запуск:**
    ```bash
-   chmod +x install.sh install_openvpn_xormask.sh
+   chmod +x install.sh openvpn-install.sh
    ```
 
 3. **Запустите установку:**
@@ -36,7 +36,7 @@
 
 Для создания, удаления и управления VPN-клиентами используйте:
 ```bash
-./install_openvpn_xormask.sh
+./openvpn-install.sh
 ```
 (Скрипт будет доступен из `/root` — можно запускать из любой директории, если перейти в `/root`, либо прямо из вашей домашней папки root.)
 
