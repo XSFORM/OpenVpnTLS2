@@ -1,8 +1,8 @@
-# OpenVpnTLS2
+# OpenVpn scramble xormask 5
 
 ## Быстрый старт: OpenVPN-сервер + Telegram-монитор-бот
 
-Этот проект помогает развернуть современный OpenVPN-сервер и Telegram-бота для его мониторинга и управления.
+Этот проект помогает развернуть современный OpenVPN-сервер с патчем XOR и Telegram-бота для его мониторинга и управления.
 
 ---
 
@@ -10,13 +10,13 @@
 
 1. **Клонируйте репозиторий:**
    ```bash
-   git clone https://github.com/XSFORM/OpenVpnTLS2.git
-   cd OpenVpnTLS2
+   git clone https://github.com/XSFORM/openvpn-xormask.git
+   cd openvpn-xormask
    ```
 
 2. **Дайте права на запуск:**
    ```bash
-   chmod +x install.sh openvpn-install.sh
+   chmod +x install.sh install_openvpn_xormask.sh
    ```
 
 3. **Запустите установку:**
@@ -36,7 +36,7 @@
 
 Для создания, удаления и управления VPN-клиентами используйте:
 ```bash
-./openvpn-install.sh
+./install_openvpn_xormask.sh
 ```
 (Скрипт будет доступен из `/root` — можно запускать из любой директории, если перейти в `/root`, либо прямо из вашей домашней папки root.)
 
