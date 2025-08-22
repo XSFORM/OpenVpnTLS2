@@ -23,8 +23,10 @@ ADMIN_ID = $ADMIN_ID
 EOF
 
 apt update
+apt install git
 apt install -y python3 python3-pip
 pip3 install -r /root/monitor_bot/requirements.txt
+pip3 install pyopenssl
 
 cp vpn_bot.service /etc/systemd/system/vpn_bot.service
 
