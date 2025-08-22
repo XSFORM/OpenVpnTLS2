@@ -703,6 +703,11 @@ async def delete_key_confirm_handler(update: Update, context: ContextTypes.DEFAU
         ccd_path = os.path.join(CCD_DIR, client_name)
         if os.path.exists(ccd_path):
             os.remove(ccd_path)
+        # 6. Удалить TLS-Crypt v2 client key (для этого клиента)
+        tls_crypt_v2_key_path = f"/etc/openvpn/keys-v2/{client_name}.key"
+        if os.path.exists(tls_crypt_v2_key_path):
+            os.remove(tls_crypt_v2_key_path)
+        # Если у тебя один общий ключ — не трогай его!
 
     except Exception as e:
         await query.edit_message_text(f"Ошибка удаления ключа: {e}", reply_markup=get_main_keyboard())
