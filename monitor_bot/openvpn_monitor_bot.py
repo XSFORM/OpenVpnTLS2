@@ -716,31 +716,36 @@ async def delete_key_cancel_handler(update: Update, context: ContextTypes.DEFAUL
 
 def generate_ovpn_for_client(
     client_name,
-    output_dir="/root",
-    template_path="/etc/openvpn/client-template.txt",
-    ca_path="/etc/openvpn/easy-rsa/pki/ca.crt",
+    output_dir=KEYS_DIR,
+    template_path=f"{OPENVPN_DIR}/client-template.txt",
+    ca_path=f"{EASYRSA_DIR}/pki/ca.crt",
     cert_path=None,
     key_path=None,
-    tls_crypt_path="/etc/openvpn/tls-crypt.key",
-    tls_auth_path="/etc/openvpn/tls-auth.key",
-    server_conf_path="/etc/openvpn/server.conf"
+    tls_crypt_path=f"{OPENVPN_DIR}/tls-crypt.key",
+    tls_crypt_v2_path=None,  # путь будет определён внутри
+    tls_auth_path=f"{OPENVPN_DIR}/tls-auth.key",
+    server_conf_path=f"{OPENVPN_DIR}/server.conf"
 ):
     if cert_path is None:
-        cert_path = f"/etc/openvpn/easy-rsa/pki/issued/{client_name}.crt"
+        cert_path = f"{EASYRSA_DIR}/pki/issued/{client_name}.crt"
     if key_path is None:
-        key_path = f"/etc/openvpn/easy-rsa/pki/private/{client_name}.key"
+        key_path = f"{EASYRSA_DIR}/pki/private/{client_name}.key"
 
     ovpn_file = os.path.join(output_dir, f"{client_name}.ovpn")
 
+    # Определяем TLS_SIG
     TLS_SIG = None
     if os.path.exists(server_conf_path):
         with open(server_conf_path, "r") as f:
             conf = f.read()
-            if "tls-crypt" in conf:
+            if "tls-crypt-v2" in conf:
+                TLS_SIG = 3
+            elif "tls-crypt" in conf:
                 TLS_SIG = 1
             elif "tls-auth" in conf:
                 TLS_SIG = 2
 
+    # читаем части файла
     with open(template_path, "r") as f:
         template_content = f.read()
     with open(ca_path, "r") as f:
@@ -755,7 +760,15 @@ def generate_ovpn_for_client(
     ovpn_content += "<cert>\n" + cert_content + "\n</cert>\n"
     ovpn_content += "<key>\n" + key_content + "\n</key>\n"
 
-    if TLS_SIG == 1 and os.path.exists(tls_crypt_path):
+    # Вставляем tls-crypt-v2 client key!
+    if TLS_SIG == 3:
+        # путь к клиентскому ключу
+        tls_crypt_v2_path = "/etc/openvpn/keys-v2/crypt2.key"
+        if os.path.exists(tls_crypt_v2_path):
+            with open(tls_crypt_v2_path, "r") as f:
+                tls_crypt_v2_content = f.read()
+            ovpn_content += "<tls-crypt-v2>\n" + tls_crypt_v2_content + "\n</tls-crypt-v2>\n"
+    elif TLS_SIG == 1 and os.path.exists(tls_crypt_path):
         with open(tls_crypt_path, "r") as f:
             tls_crypt_content = f.read()
         ovpn_content += "<tls-crypt>\n" + tls_crypt_content + "\n</tls-crypt>\n"
