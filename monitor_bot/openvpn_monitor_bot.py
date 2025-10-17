@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-OpenVPN Telegram Monitor Bot (TLS-crypt v2 edition)
+OpenVPN Telegram Monitor Bot (TLS-crypt v2 edition; autodetect + Telegraph fallback + robust input flags)
 База: функционал из XSFORM/OpenVpn-scramble-xormask (2025-10-01) +
-      поддержка tls-crypt-v2 при генерации/удалении ключей.
+      поддержка tls-crypt-v2 при генерации/удалении ключей + авто-детект.
 
-Различия от «v1»:
-- Генерация .ovpn: если server.conf содержит 'tls-crypt-v2', встраивается блок <tls-crypt-v2>…</tls-crypt-v2>.
-- Удаление клиента: дополнительно удаляется per-client ключ tls-crypt-v2, если он существует.
-- Остальной функционал идентичен: логические сроки, массовые операции, трафик, Telegraph, backup/restore, обновление remote и т.д.
+- Авто-детект tls-crypt-v2 (server.conf и server/server.conf)
+- Поиск клиентского tls-crypt-v2 ключа: per-client -> crypt2.key -> crypt.key -> tls-crypt-v2-client.key -> первый валидный *.key
+- Telegraph fallback: если Telegra.ph недоступен, списки выводятся прямо в чат.
+- Надёжная обработка числового ввода: флаги ожидания дублируются в user_data и chat_data.
+- Исправлены кнопки: Удалить/Отправить/Вкл/Откл/Обновить адрес/Помощь/Лог.
 """
 
 import os
@@ -24,11 +25,9 @@ import requests
 import shutil
 import socket
 
-# Криптография / даты сертификата
 from OpenSSL import crypto
 import pytz
 
-# Telegram
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 )
@@ -37,10 +36,8 @@ from telegram.ext import (
     MessageHandler, filters
 )
 
-# Конфиг бота
 from config import TOKEN, ADMIN_ID
 
-# Backup/Restore: используем продвинутую версию, если модуль есть, иначе graceful degrade
 BACKUP_AVAILABLE = True
 try:
     from backup_restore import (
@@ -56,8 +53,7 @@ except Exception:
     def br_create_backup():
         raise RuntimeError("backup_restore.py не найден")
 
-# ------------------ Константы / Глобалы ------------------
-BOT_VERSION = "2025-10-16-tlsv2-merge"
+BOT_VERSION = "2025-10-16-tlsv2-autodetect+tg-fallback+robust-input"
 UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
 SIMPLE_UPDATE_CMD = (
     "curl -L -o /root/monitor_bot/openvpn_monitor_bot.py "
@@ -74,18 +70,18 @@ EASYRSA_DIR = "/etc/openvpn/easy-rsa"
 STATUS_LOG = "/var/log/openvpn/status.log"
 CCD_DIR = "/etc/openvpn/ccd"
 
-# TLS-crypt v2: где искать клиентские ключи для встраивания
-# Порядок поиска: /etc/openvpn/keys-v2/<client>.key -> /etc/openvpn/keys-v2/crypt2.key -> /etc/openvpn/tls-crypt-v2-client.key
 TLS_CRYPT_V2_DIR = "/etc/openvpn/keys-v2"
 TLS_CRYPT_V2_DEFAULTS = [
     os.path.join(TLS_CRYPT_V2_DIR, "crypt2.key"),
+    os.path.join(TLS_CRYPT_V2_DIR, "crypt.key"),
     "/etc/openvpn/tls-crypt-v2-client.key",
+    "/etc/openvpn/server/tls-crypt-v2-client.key",
 ]
+TLS_V2_HEADER = "BEGIN OpenVPN tls-crypt-v2 client key"
 
 SEND_NEW_OVPN_ON_RENEW = False
 TM_TZ = pytz.timezone("Asia/Ashgabat")
 
-# Management (TCP, если настроен) + fallback unix socket
 MGMT_SOCKET = "/var/run/openvpn.sock"
 MANAGEMENT_HOST = "127.0.0.1"
 MANAGEMENT_PORT = 7505
@@ -106,26 +102,22 @@ CLIENT_META_PATH = "/root/monitor_bot/clients_meta.json"
 client_meta: Dict[str, Dict[str, str]] = {}
 
 ENFORCE_INTERVAL_SECONDS = 43200  # 12 часов
-
-ROOT_ARCHIVE_EXCLUDE_GLOBS = ["/root/*.tar.gz", "/root/*.tgz"]
-EXCLUDE_TEMP_DIR = "/root/monitor_bot/.excluded_root_archives"
-
 PAGE_SIZE_KEYS = 40
 
-# Постоянное меню (inline)
 MENU_MESSAGE_ID = None
 MENU_CHAT_ID = None
 
-# Предупреждения о скором истечении
 _notified_expiry: Dict[str, str] = {}
 UPCOMING_EXPIRY_DAYS = 1
 
-# ---------- Натуральная сортировка ----------
 _nat_num_re = re.compile(r'(\d+)')
 def _natural_key(s: str):
     return [int(x) if x.isdigit() else x.lower() for x in _nat_num_re.split(s)]
 def natural_sorted(seq: List[str]) -> List[str]:
     return sorted(seq, key=_natural_key)
+
+def _tz_now_str():
+    return datetime.now(pytz.utc).astimezone(TM_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 def locate_backup(fname: str) -> Optional[str]:
     if fname.startswith("/"):
@@ -144,6 +136,30 @@ def locate_backup(fname: str) -> Optional[str]:
             return p
     return None
 
+# ------------------ Надёжные флаги ожидания (user_data + chat_data) ------------------
+def set_flag(context: ContextTypes.DEFAULT_TYPE, key: str, value=True):
+    context.user_data[key] = value
+    context.chat_data[key] = value
+
+def get_flag(context: ContextTypes.DEFAULT_TYPE, key: str) -> bool:
+    return bool(context.user_data.get(key) or context.chat_data.get(key))
+
+def clear_flag(context: ContextTypes.DEFAULT_TYPE, key: str):
+    context.user_data.pop(key, None)
+    context.chat_data.pop(key, None)
+
+def set_store(context: ContextTypes.DEFAULT_TYPE, key: str, value):
+    context.user_data[key] = value
+    context.chat_data[key] = value
+
+def get_store(context: ContextTypes.DEFAULT_TYPE, key: str, default=None):
+    return context.user_data.get(key, context.chat_data.get(key, default))
+
+def clear_store(context: ContextTypes.DEFAULT_TYPE, *keys):
+    for k in keys:
+        context.user_data.pop(k, None)
+        context.chat_data.pop(k, None)
+
 # ------------------ Логические сроки ------------------
 def load_client_meta():
     global client_meta
@@ -154,7 +170,7 @@ def load_client_meta():
         else:
             client_meta = {}
     except Exception as e:
-        print(f"[meta] load error: {e}")
+        print(f"[{_tz_now_str()}] [meta] load error: {e}")
         client_meta = {}
 
 def save_client_meta():
@@ -164,7 +180,7 @@ def save_client_meta():
             json.dump(client_meta, f)
         os.replace(tmp, CLIENT_META_PATH)
     except Exception as e:
-        print(f"[meta] save error: {e}")
+        print(f"[{_tz_now_str()}] [meta] save error: {e}")
 
 def set_client_expiry_days_from_now(name: str, days: int) -> str:
     if days < 1:
@@ -205,7 +221,7 @@ def enforce_client_expiries():
             disconnect_client_sessions(name)
             changed = True
     if changed:
-        print("[meta] enforced expiries")
+        print(f"[{_tz_now_str()}] [meta] enforced expiries")
 
 def check_and_notify_expiring(bot):
     if not client_meta:
@@ -226,15 +242,15 @@ def check_and_notify_expiring(bot):
             try:
                 bot.send_message(
                     ADMIN_ID,
-                    f"?? Клиент {name} истекает через {days_left} день (до {iso}). Продли: ? Обновить ключ."
+                    f"\u26A0\ufe0f Клиент {name} истекает через {days_left} день (до {iso}). Продли: \u231B Обновить ключ."
                 )
                 _notified_expiry[name] = iso
             except Exception as e:
-                print(f"[notify_expiring] fail {name}: {e}")
+                print(f"[{_tz_now_str()}] [notify_expiring] fail {name}: {e}")
         elif _notified_expiry.get(name) and _notified_expiry.get(name) != iso and days_left >= 0:
             _notified_expiry.pop(name, None)
 
-# ------------------ Management (отключение сессий) ------------------
+# ------------------ Management ------------------
 def _mgmt_tcp_command(cmd: str) -> str:
     data = b""
     with socket.create_connection((MANAGEMENT_HOST, MANAGEMENT_PORT), MANAGEMENT_TIMEOUT) as s:
@@ -255,22 +271,20 @@ def _mgmt_tcp_command(cmd: str) -> str:
     return data.decode(errors="ignore")
 
 def disconnect_client_sessions(client_name: str) -> bool:
-    # Сначала пробуем TCP management (если настроен)
     try:
         out = _mgmt_tcp_command(f"client-kill {client_name}")
         if out:
-            print(f"[mgmt] client-kill {client_name} -> {out.strip()[:120]}")
+            print(f"[{_tz_now_str()}] [mgmt] client-kill {client_name} -> {out.strip()[:120]}")
             return True
     except Exception:
         pass
-    # Fallback: unix socket (как в TLS2)
     if os.path.exists(MGMT_SOCKET):
         try:
             subprocess.run(f'echo "kill {client_name}" | nc -U {MGMT_SOCKET}', shell=True)
-            print(f"[mgmt] unix kill {client_name}")
+            print(f"[{_tz_now_str()}] [mgmt] unix kill {client_name}")
             return True
         except Exception as e:
-            print(f"[mgmt] unix kill failed {client_name}: {e}")
+            print(f"[{_tz_now_str()}] [mgmt] unix kill failed {client_name}: {e}")
     return False
 
 # ------------------ Update helpers ------------------
@@ -287,7 +301,7 @@ async def send_simple_update_command(update: Update, context: ContextTypes.DEFAU
     if q.from_user.id != ADMIN_ID:
         await q.answer("Нет доступа", show_alert=True); return
     await q.answer()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("?? Копия", callback_data="copy_update_cmd")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001F4CB Копия", callback_data="copy_update_cmd")]])
     await context.bot.send_message(
         chat_id=q.message.chat_id,
         text=f"<b>Команда обновления (версия {BOT_VERSION}):</b>\n<code>{SIMPLE_UPDATE_CMD}</code>",
@@ -342,14 +356,14 @@ def format_clients_by_certs():
     if not os.path.isdir(cert_dir):
         return "<b>Список клиентов:</b>\n\nКаталог issued отсутствует."
     certs = [f for f in os.listdir(cert_dir) if f.endswith(".crt")]
-    certs = sorted(certs, key=lambda x: _natural_key(x[:-4]))  # натурально по имени без .crt
+    certs = sorted(certs, key=lambda x: _natural_key(x[:-4]))
     res = "<b>Список клиентов (по сертификатам):</b>\n\n"
     idx = 1
     for f in certs:
         name = f[:-4]
         if name.startswith("server_"):
             continue
-        mark = "?" if is_client_ccd_disabled(name) else "??"
+        mark = "\u26D4" if is_client_ccd_disabled(name) else "\U0001F7E2"
         res += f"{idx}. {mark} <b>{name}</b>\n"
         idx += 1
     if idx == 1:
@@ -419,7 +433,7 @@ def build_keys_table_text(rows: List[Dict]):
         lines.append(f"{i} | {r['name'].ljust(name_w)} | {r['days'].ljust(days_w)} | {r['cfg'].ljust(cfg_w)} | {r['created']}")
     return "\n".join(lines)
 
-# ------------------ Telegraph ------------------
+# ------------------ Telegraph + fallback ------------------
 def get_telegraph_token() -> Optional[str]:
     try:
         if os.path.exists(TELEGRAPH_TOKEN_FILE):
@@ -437,7 +451,7 @@ def get_telegraph_token() -> Optional[str]:
                 f.write(token)
             return token
     except Exception as e:
-        print(f"[telegraph] token error: {e}")
+        print(f"[{_tz_now_str()}] [telegraph] token error: {e}")
     return None
 
 def create_telegraph_pre_page(title: str, text: str) -> Optional[str]:
@@ -455,8 +469,15 @@ def create_telegraph_pre_page(title: str, text: str) -> Optional[str]:
         data = resp.json()
         return data.get("result", {}).get("url")
     except Exception as e:
-        print(f"[telegraph] create page error: {e}")
+        print(f"[{_tz_now_str()}] [telegraph] create page error: {e}")
         return None
+
+def _fallback_names_page(names: List[str], title: str, caption: str) -> str:
+    names = natural_sorted(names)
+    lines = [f"{title}", caption, ""]
+    for i, n in enumerate(names, 1):
+        lines.append(f"{i}. {n}")
+    return "\n".join(lines)
 
 def create_keys_detailed_page():
     rows = gather_key_metadata()
@@ -464,602 +485,65 @@ def create_keys_detailed_page():
     text = "Полный список ключей (СерДн = остаток по сертификату, не логический срок)\n\n" + build_keys_table_text(rows)
     return create_telegraph_pre_page("Список ключей", text)
 
-def create_names_telegraph_page(names: List[str], title: str, caption: str) -> Optional[str]:
-    if not names: return None
-    names = natural_sorted(names)
-    lines = [caption, ""]
-    for i, n in enumerate(names, 1):
-        lines.append(f"{i}. {n}")
-    return create_telegraph_pre_page(title, "\n".join(lines))
+def create_names_telegraph_page(names: List[str], title: str, caption: str) -> Tuple[Optional[str], Optional[str]]:
+    if not names: return None, None
+    url = create_telegraph_pre_page(title, "\n".join([caption] + [f"{i}. {n}" for i, n in enumerate(natural_sorted(names), 1)]))
+    fallback = _fallback_names_page(names, title, caption) if not url else None
+    return url, fallback
 
-# ------------------ Парсер множественного выбора ------------------
-def parse_bulk_selection(text: str, max_index: int) -> Tuple[List[int], List[str]]:
-    text = text.strip().lower()
-    if not text: return [], ["Пустой ввод."]
-    if text == "all":
-        return list(range(1, max_index + 1)), []
-    parts = re.split(r"[,\s]+", text)
-    chosen, errors = set(), []
-    for p in parts:
-        if not p: continue
-        if re.fullmatch(r"\d+", p):
-            idx = int(p)
-            if 1 <= idx <= max_index: chosen.add(idx)
-            else: errors.append(f"Число вне диапазона: {p}")
-        elif re.fullmatch(r"\d+-\d+", p):
-            a, b = p.split('-'); a, b = int(a), int(b)
-            if a > b: a, b = b, a
-            if a < 1 or b > max_index:
-                errors.append(f"Диапазон вне диапазона: {p}")
-                continue
-            for i in range(a, b + 1):
-                chosen.add(i)
-        else:
-            errors.append(f"Неверный фрагмент: {p}")
-    return sorted(chosen), errors
-
-# ------------------ Массовое удаление ------------------
-def revoke_and_collect(names: List[str]) -> Tuple[List[str], List[str]]:
-    revoked, failed = [], []
-    for name in names:
-        cert_path = f"{EASYRSA_DIR}/pki/issued/{name}.crt"
-        if not os.path.exists(cert_path):
-            revoked.append(name); continue
+# ------------------ TLS-crypt-v2 detect/search ------------------
+def _detect_tls_sig() -> int:
+    candidates = [
+        os.path.join(OPENVPN_DIR, "server.conf"),
+        os.path.join(OPENVPN_DIR, "server", "server.conf"),
+    ]
+    for p in candidates:
         try:
-            subprocess.run(f"cd {EASYRSA_DIR} && ./easyrsa --batch revoke {name}", shell=True, check=True)
-            revoked.append(name)
-        except subprocess.CalledProcessError as e:
-            failed.append(f"{name}: revoke error {e}")
-    return revoked, failed
+            if os.path.exists(p):
+                with open(p, "r", errors="ignore") as f:
+                    conf = f.read().lower()
+                if "tls-crypt-v2" in conf:
+                    print(f"[{_tz_now_str()}] [tls] detected tls-crypt-v2 in {p}")
+                    return 3
+                if "tls-crypt" in conf:
+                    print(f"[{_tz_now_str()}] [tls] detected tls-crypt in {p}")
+                    return 1
+                if "tls-auth" in conf:
+                    print(f"[{_tz_now_str()}] [tls] detected tls-auth in {p}")
+                    return 2
+        except Exception as e:
+            print(f"[{_tz_now_str()}] [tls] read server.conf failed {p}: {e}")
+    print(f"[{_tz_now_str()}] [tls] no tls-* signature detected")
+    return 0
 
-def generate_crl_once() -> Optional[str]:
+def _file_contains_tlsv2_key(path: str) -> bool:
     try:
-        subprocess.run(f"cd {EASYRSA_DIR} && EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl", shell=True, check=True)
-        crl_src = f"{EASYRSA_DIR}/pki/crl.pem"; crl_dst = "/etc/openvpn/crl.pem"
-        if os.path.exists(crl_src):
-            subprocess.run(f"cp {crl_src} {crl_dst}", shell=True, check=True)
-            os.chmod(crl_dst, 0o644)
-        return "OK"
-    except Exception as e:
-        return f"CRL error: {e}"
+        with open(path, "r", errors="ignore") as f:
+            head = f.read(200)
+        return TLS_V2_HEADER in head
+    except Exception:
+        return False
 
 def _tlsv2_client_key_path_for(name: str) -> Optional[str]:
-    # 1) per-client
-    cand = os.path.join(TLS_CRYPT_V2_DIR, f"{name}.key")
-    if os.path.exists(cand):
-        return cand
-    # 2) defaults
-    for p in TLS_CRYPT_V2_DEFAULTS:
-        if os.path.exists(p):
+    candidates = [os.path.join(TLS_CRYPT_V2_DIR, f"{name}.key")] + TLS_CRYPT_V2_DEFAULTS
+    for p in candidates:
+        if os.path.exists(p) and _file_contains_tlsv2_key(p):
+            print(f"[{_tz_now_str()}] [tlsv2] using client key: {p}")
             return p
-    return None
-
-def remove_client_files(name: str):
-    paths = [
-        os.path.join(KEYS_DIR, f"{name}.ovpn"),
-        f"{EASYRSA_DIR}/pki/issued/{name}.crt",
-        f"{EASYRSA_DIR}/pki/private/{name}.key",
-        f"{EASYRSA_DIR}/pki/reqs/{name}.req",
-        os.path.join(CCD_DIR, name)
-    ]
-    for p in paths:
-        try:
-            if os.path.exists(p): os.remove(p)
-        except Exception as e:
-            print(f"[delete] cannot remove {p}: {e}")
-    # Удаляем перс. ключ tls-crypt-v2, если он именно персонифицирован
-    v2key = os.path.join(TLS_CRYPT_V2_DIR, f"{name}.key")
     try:
-        if os.path.exists(v2key):
-            os.remove(v2key)
+        if os.path.isdir(TLS_CRYPT_V2_DIR):
+            for fname in sorted(os.listdir(TLS_CRYPT_V2_DIR)):
+                if fname.endswith(".key"):
+                    p = os.path.join(TLS_CRYPT_V2_DIR, fname)
+                    if _file_contains_tlsv2_key(p):
+                        print(f"[{_tz_now_str()}] [tlsv2] fallback client key: {p}")
+                        return p
     except Exception as e:
-        print(f"[delete] cannot remove v2 key {v2key}: {e}")
-
-    if name in client_meta:
-        client_meta.pop(name, None); save_client_meta()
-    if name in traffic_usage:
-        traffic_usage.pop(name, None); save_traffic_db(force=True)
-
-# ------------------ Бэкап (скрытие архивов /root) ------------------
-TMP_EXCLUDE_DIR = "/tmp/._exclude_root_archives"
-def _temporarily_hide_root_backup_stuff() -> List[Tuple[str, str, str]]:
-    os.makedirs(TMP_EXCLUDE_DIR, exist_ok=True)
-    moved: List[Tuple[str, str, str]] = []
-    for pattern in ("/root/*.tar.gz", "/root/*.tgz"):
-        for src in glob.glob(pattern):
-            dst = os.path.join(TMP_EXCLUDE_DIR, os.path.basename(src))
-            try:
-                if os.path.abspath(src) != os.path.abspath(dst):
-                    if os.path.exists(dst): os.remove(dst)
-                    shutil.move(src, dst)
-                    moved.append(("file", src, dst))
-            except Exception as e:
-                print(f"[backup exclude] cannot move {src}: {e}")
-    backups_dir = "/root/backups"
-    if os.path.isdir(backups_dir):
-        dst_dir = os.path.join(TMP_EXCLUDE_DIR, "__backups_dir__")
-        try:
-            if os.path.exists(dst_dir): shutil.rmtree(dst_dir, ignore_errors=True)
-            shutil.move(backups_dir, dst_dir)
-            moved.append(("dir", backups_dir, dst_dir))
-        except Exception as e:
-            print(f"[backup exclude] cannot move {backups_dir}: {e}")
-    return moved
-
-def _restore_hidden_root_backup_stuff(moved: List[Tuple[str, str, str]]):
-    for kind, src, dst in reversed(moved):
-        try:
-            if os.path.exists(src):
-                if os.path.exists(dst):
-                    if kind == "dir": shutil.rmtree(dst, ignore_errors=True)
-                    else: os.remove(dst)
-                continue
-            if os.path.exists(dst):
-                os.makedirs(os.path.dirname(src), exist_ok=True)
-                shutil.move(dst, src)
-        except Exception as e:
-            print(f"[backup exclude] cannot restore {src}: {e}")
-
-def create_backup_in_root_excluding_archives() -> str:
-    if not BACKUP_AVAILABLE:
-        raise RuntimeError("Расширенный backup недоступен: нет backup_restore.py")
-    moved = _temporarily_hide_root_backup_stuff()
-    try:
-        path = br_create_backup()
-        if not path or not os.path.exists(path):
-            raise RuntimeError("Backup creation failed (no path returned)")
-        dest = os.path.join("/root", os.path.basename(path))
-        if os.path.abspath(path) != os.path.abspath(dest):
-            if os.path.exists(dest): os.remove(dest)
-            shutil.move(path, dest)
-        else:
-            dest = path
-        return dest
-    finally:
-        _restore_hidden_root_backup_stuff(moved)
-
-# ------------------ BULK HANDLERS (delete/send/enable/disable) ------------------
-async def start_bulk_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    rows = gather_key_metadata()
-    if not rows:
-        await safe_edit_text(q, context, "Нет ключей."); return
-    url = create_keys_detailed_page()
-    if not url:
-        await safe_edit_text(q, context, "Ошибка Telegraph."); return
-    keys_order = [r["name"] for r in rows]
-    context.user_data['bulk_delete_keys'] = keys_order
-    context.user_data['await_bulk_delete_numbers'] = True
-    text = ("<b>Удаление ключей</b>\n"
-            "Формат: all | 1 | 1,2,5 | 3-7 | 1,2,5-9\n"
-            f"<a href=\"{url}\">Полный список</a>\n\nОтправьте строку с номерами.")
-    await safe_edit_text(q, context, text, parse_mode="HTML",
-                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_delete")]]))
-
-async def process_bulk_delete_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('await_bulk_delete_numbers'): return
-    keys_order: List[str] = context.user_data.get('bulk_delete_keys', [])
-    if not keys_order:
-        await update.message.reply_text("Список потерян. Начните снова.")
-        context.user_data.pop('await_bulk_delete_numbers', None); return
-    selection_text = update.message.text.strip()
-    idxs, errs = parse_bulk_selection(selection_text, len(keys_order))
-    if errs:
-        await update.message.reply_text("Ошибки:\n" + "\n".join(errs) + "\nПовторите ввод.",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_delete")]]))
-        return
-    if not idxs:
-        await update.message.reply_text("Ничего не выбрано.",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_delete")]]))
-        return
-    selected_names = [keys_order[i - 1] for i in idxs]
-    context.user_data['bulk_delete_selected'] = selected_names
-    context.user_data['await_bulk_delete_numbers'] = False
-    preview = "\n".join(selected_names[:25])
-    if len(selected_names) > 25:
-        preview += f"\n... ещё {len(selected_names)-25}"
-    await update.message.reply_text(
-        f"<b>Удалить ключи ({len(selected_names)}):</b>\n<code>{preview}</code>\nПодтвердить?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("? Да", callback_data="bulk_delete_confirm")],
-            [InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_delete")]
-        ])
-    )
-
-async def bulk_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    selected: List[str] = context.user_data.get('bulk_delete_selected', [])
-    if not selected:
-        await safe_edit_text(q, context, "Пусто."); return
-    revoked, failed = revoke_and_collect(selected)
-    crl_status = generate_crl_once()
-    for name in revoked:
-        remove_client_files(name)
-        disconnect_client_sessions(name)
-    context.user_data.pop('bulk_delete_selected', None)
-    context.user_data.pop('bulk_delete_keys', None)
-    summary = (f"<b>Удаление завершено</b>\n"
-               f"Запрошено: {len(selected)}\nRevoked: {len(revoked)}\nОшибок: {len(failed)}\nCRL: {crl_status}")
-    if failed:
-        summary += "\n\n<b>Ошибки:</b>\n" + "\n".join(failed[:10])
-        if len(failed) > 10:
-            summary += f"\n... ещё {len(failed)-10}"
-    await safe_edit_text(q, context, summary, parse_mode="HTML")
-
-async def bulk_delete_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer("Отменено")
-    for k in ['bulk_delete_selected', 'bulk_delete_keys', 'await_bulk_delete_numbers']:
-        context.user_data.pop(k, None)
-    await safe_edit_text(q, context, "Массовое удаление отменено.")
-
-# ------------------ Массовая отправка ------------------
-async def start_bulk_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    files = get_ovpn_files()
-    files = sorted(files, key=lambda x: _natural_key(x[:-5]))
-    if not files:
-        await safe_edit_text(q, context, "Нет ключей."); return
-    names = [f[:-5] for f in files]
-    url = create_names_telegraph_page(names, "Отправка ключей", "Список ключей")
-    if not url:
-        await safe_edit_text(q, context, "Ошибка Telegraph."); return
-    context.user_data['bulk_send_keys'] = names
-    context.user_data['await_bulk_send_numbers'] = True
-    text = ("<b>Отправить ключи</b>\n"
-            "Формат: all | 1 | 1,2,5 | 3-7 | 1,2,5-9\n"
-            f"<a href=\"{url}\">Список</a>\n\nПришлите строку.")
-    await safe_edit_text(q, context, text, parse_mode="HTML",
-                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_send")]]))
-
-async def process_bulk_send_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('await_bulk_send_numbers'): return
-    names: List[str] = context.user_data.get('bulk_send_keys', [])
-    if not names:
-        await update.message.reply_text("Список потерян. Начните заново.")
-        context.user_data.pop('await_bulk_send_numbers', None); return
-    idxs, errs = parse_bulk_selection(update.message.text.strip(), len(names))
-    if errs:
-        await update.message.reply_text("Ошибки:\n" + "\n".join(errs),
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_send")]]))
-        return
-    if not idxs:
-        await update.message.reply_text("Ничего не выбрано.",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_send")]]))
-        return
-    selected = [names[i - 1] for i in idxs]
-    context.user_data['bulk_send_selected'] = selected
-    context.user_data['await_bulk_send_numbers'] = False
-    preview = "\n".join(selected[:25])
-    if len(selected) > 25: preview += f"\n... ещё {len(selected)-25}"
-    await update.message.reply_text(
-        f"<b>Отправить ({len(selected)}) ключей:</b>\n<code>{preview}</code>\nПодтвердить?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("? Да", callback_data="bulk_send_confirm")],
-            [InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_send")]
-        ])
-    )
-
-async def bulk_send_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import asyncio
-    q = update.callback_query; await q.answer()
-    selected: List[str] = context.user_data.get('bulk_send_selected', [])
-    if not selected:
-        await safe_edit_text(q, context, "Список пуст."); return
-    await safe_edit_text(q, context, f"Отправляю {len(selected)} ключ(ов)...")
-    sent = 0
-    for name in selected:
-        path = os.path.join(KEYS_DIR, f"{name}.ovpn")
-        if os.path.exists(path):
-            try:
-                with open(path, "rb") as f:
-                    await context.bot.send_document(chat_id=q.message.chat_id, document=InputFile(f), filename=f"{name}.ovpn")
-                sent += 1
-                await asyncio.sleep(0.25)
-            except Exception as e:
-                print(f"[bulk_send] error {name}: {e}")
-    for k in ['bulk_send_selected', 'bulk_send_keys', 'await_bulk_send_numbers']:
-        context.user_data.pop(k, None)
-    await context.bot.send_message(chat_id=q.message.chat_id, text=f"? Отправлено: {sent} / {len(selected)}")
-
-async def bulk_send_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer("Отменено")
-    for k in ['bulk_send_selected', 'bulk_send_keys', 'await_bulk_send_numbers']:
-        context.user_data.pop(k, None)
-    await safe_edit_text(q, context, "Массовая отправка отменена.")
-
-# ------------------ Массовое включение/отключение ------------------
-async def start_bulk_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    files = get_ovpn_files()
-    files = sorted(files, key=lambda x: _natural_key(x[:-5]))
-    disabled = [f[:-5] for f in files if is_client_ccd_disabled(f[:-5])]
-    if not disabled:
-        await safe_edit_text(q, context, "Нет заблокированных клиентов."); return
-    url = create_names_telegraph_page(disabled, "Включение клиентов", "Заблокированные клиенты")
-    if not url:
-        await safe_edit_text(q, context, "Ошибка Telegraph."); return
-    context.user_data['bulk_enable_keys'] = disabled
-    context.user_data['await_bulk_enable_numbers'] = True
-    text = ("<b>Включить клиентов</b>\n"
-            "Формат: all | 1 | 1,2 | 3-7 ...\n"
-            f"<a href=\"{url}\">Список</a>\n\nПришлите строку.")
-    await safe_edit_text(q, context, text, parse_mode="HTML",
-                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_enable")]]))
-
-async def process_bulk_enable_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('await_bulk_enable_numbers'): return
-    names: List[str] = context.user_data.get('bulk_enable_keys', [])
-    if not names:
-        await update.message.reply_text("Список потерян.")
-        context.user_data.pop('await_bulk_enable_numbers', None); return
-    idxs, errs = parse_bulk_selection(update.message.text.strip(), len(names))
-    if errs:
-        await update.message.reply_text("Ошибки:\n" + "\n".join(errs),
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_enable")]]))
-        return
-    if not idxs:
-        await update.message.reply_text("Ничего не выбрано.",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_enable")]]))
-        return
-    selected = [names[i - 1] for i in idxs]
-    context.user_data['bulk_enable_selected'] = selected
-    context.user_data['await_bulk_enable_numbers'] = False
-    preview = "\n".join(selected[:30])
-    if len(selected) > 30: preview += f"\n... ещё {len(selected)-30}"
-    await update.message.reply_text(
-        f"<b>Включить ({len(selected)}):</b>\n<code>{preview}</code>\nПодтвердить?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("? Да", callback_data="bulk_enable_confirm")],
-            [InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_enable")]
-        ])
-    )
-
-async def bulk_enable_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    selected: List[str] = context.user_data.get('bulk_enable_selected', [])
-    if not selected:
-        await safe_edit_text(q, context, "Пусто."); return
-    for name in selected:
-        unblock_client_ccd(name)
-    for k in ['bulk_enable_selected', 'bulk_enable_keys', 'await_bulk_enable_numbers']:
-        context.user_data.pop(k, None)
-    await safe_edit_text(q, context, f"? Включено клиентов: {len(selected)}")
-
-async def bulk_enable_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer("Отменено")
-    for k in ['bulk_enable_selected', 'bulk_enable_keys', 'await_bulk_enable_numbers']:
-        context.user_data.pop(k, None)
-    await safe_edit_text(q, context, "Массовое включение отменено.")
-
-async def start_bulk_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    files = get_ovpn_files()
-    files = sorted(files, key=lambda x: _natural_key(x[:-5]))
-    active = [f[:-5] for f in files if not is_client_ccd_disabled(f[:-5])]
-    if not active:
-        await safe_edit_text(q, context, "Нет активных клиентов."); return
-    url = create_names_telegraph_page(active, "Отключение клиентов", "Активные клиенты")
-    if not url:
-        await safe_edit_text(q, context, "Ошибка Telegraph."); return
-    context.user_data['bulk_disable_keys'] = active
-    context.user_data['await_bulk_disable_numbers'] = True
-    text = ("<b>Отключить клиентов</b>\n"
-            "Формат: all | 1 | 1,2,7 | 3-10 ...\n"
-            f"<a href=\"{url}\">Список</a>\n\nПришлите строку.")
-    await safe_edit_text(q, context, text, parse_mode="HTML",
-                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_disable")]]))
-
-async def process_bulk_disable_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('await_bulk_disable_numbers'): return
-    names: List[str] = context.user_data.get('bulk_disable_keys', [])
-    if not names:
-        await update.message.reply_text("Список потерян.")
-        context.user_data.pop('await_bulk_disable_numbers', None); return
-    idxs, errs = parse_bulk_selection(update.message.text.strip(), len(names))
-    if errs:
-        await update.message.reply_text("Ошибки:\n" + "\n".join(errs),
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_disable")]]))
-        return
-    if not idxs:
-        await update.message.reply_text("Ничего не выбрано.",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_disable")]]))
-        return
-    selected = [names[i - 1] for i in idxs]
-    context.user_data['bulk_disable_selected'] = selected
-    context.user_data['await_bulk_disable_numbers'] = False
-    preview = "\n".join(selected[:30])
-    if len(selected) > 30: preview += f"\n... ещё {len(selected)-30}"
-    await update.message.reply_text(
-        f"<b>Отключить ({len(selected)}):</b>\n<code>{preview}</code>\nПодтвердить?",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("? Да", callback_data="bulk_disable_confirm")],
-            [InlineKeyboardButton("? Отмена", callback_data="cancel_bulk_disable")]
-        ])
-    )
-
-async def bulk_disable_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    selected: List[str] = context.user_data.get('bulk_disable_selected', [])
-    if not selected:
-        await safe_edit_text(q, context, "Пусто."); return
-    for name in selected:
-        block_client_ccd(name); disconnect_client_sessions(name)
-    for k in ['bulk_disable_selected', 'bulk_disable_keys', 'await_bulk_disable_numbers']:
-        context.user_data.pop(k, None)
-    await safe_edit_text(q, context, f"?? Отключено клиентов: {len(selected)}")
-
-async def bulk_disable_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer("Отменено")
-    for k in ['bulk_disable_selected', 'bulk_disable_keys', 'await_bulk_disable_numbers']:
-        context.user_data.pop(k, None)
-    await safe_edit_text(q, context, "Массовое отключение отменено.")
-
-# ------------------ UPDATE REMOTE ------------------
-CLIENT_TEMPLATE_CANDIDATES = [
-    "/etc/openvpn/client-template.txt",
-    "/root/openvpn/client-template.txt"
-]
-def find_client_template_path() -> Optional[str]:
-    for p in CLIENT_TEMPLATE_CANDIDATES:
-        if os.path.exists(p): return p
+        print(f"[{_tz_now_str()}] [tlsv2] scan keys-v2 failed: {e}")
+    print(f"[{_tz_now_str()}] [tlsv2] client key not found in any known location")
     return None
 
-def replace_remote_line_in_text(text: str, new_host: str, new_port: str) -> str:
-    lines = []; replaced = False
-    for line in text.splitlines():
-        if line.strip().startswith("remote "):
-            lines.append(f"remote {new_host} {new_port}"); replaced = True
-        else:
-            lines.append(line)
-    if not replaced:
-        lines.append(f"remote {new_host} {new_port}")
-    return "\n".join(lines) + "\n"
-
-def update_template_and_ovpn(new_host: str, new_port: str) -> Dict[str, int]:
-    stats = {"template_updated": 0, "ovpn_updated": 0, "errors": 0}
-    tpl = find_client_template_path()
-    if tpl:
-        try:
-            with open(tpl, "r") as f: old = f.read()
-            new = replace_remote_line_in_text(old, new_host, new_port)
-            if new != old:
-                backup = tpl + ".bak_" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
-                shutil.copy2(tpl, backup)
-                with open(tpl, "w") as f: f.write(new)
-                stats["template_updated"] = 1
-        except Exception as e:
-            print(f"[update_remote] template error: {e}"); stats["errors"] += 1
-    else:
-        print("[update_remote] template not found")
-    for f in get_ovpn_files():
-        path = os.path.join(KEYS_DIR, f)
-        try:
-            with open(path, "r") as fr: oldc = fr.read()
-            newc = replace_remote_line_in_text(oldc, new_host, new_port)
-            if newc != oldc:
-                bak = path + ".bak_" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
-                shutil.copy2(path, bak)
-                with open(path, "w") as fw: fw.write(newc)
-                stats["ovpn_updated"] += 1
-        except Exception as e:
-            print(f"[update_remote] file {f} error: {e}"); stats["errors"] += 1
-    return stats
-
-async def start_update_remote_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    tpl = find_client_template_path()
-    tpl_info = tpl if tpl else "не найден"
-    text = ("Введите новый remote в формате host:port\n"
-            f"(Обнаруженный шаблон: {tpl_info})\nПример: vpn.example.com:1194")
-    await safe_edit_text(q, context, text,
-                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_update_remote")]]))
-    context.user_data['await_remote_input'] = True
-
-async def process_remote_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('await_remote_input'): return
-    raw = update.message.text.strip()
-    if ':' not in raw:
-        await update.message.reply_text("Формат неверный. Нужно host:port. Пример: myvpn.com:1194"); return
-    host, port = raw.split(':', 1)
-    host, port = host.strip(), port.strip()
-    if not host or not port.isdigit():
-        await update.message.reply_text("Некорректные host или port."); return
-    stats = update_template_and_ovpn(host, port)
-    context.user_data.pop('await_remote_input', None)
-    await update.message.reply_text(
-        f"? Обновление завершено.\nШаблон: {stats['template_updated']}\n.ovpn изменено: {stats['ovpn_updated']}\nОшибок: {stats['errors']}"
-    )
-
-# ------------------ HELP ------------------
-HELP_TEXT = """? Справка
-
-• Список / Статистика ключей
-• Создание/Удаление/Отправка/Блокировка/Включение
-• Логические сроки (продлевай через «? Обновить ключ»)
-• Трафик и очистка
-• Бэкап/восстановление
-• Обновление remote
-• Мониторинг подключений/блокировки
-
-На этом сервере используется TLS-Crypt v2: .ovpn включает <tls-crypt-v2> блок автоматически.
-"""
-
-def build_help_messages():
-    esc = escape(HELP_TEXT.strip("\n"))
-    lines = esc.splitlines()
-    parts, block, cur_len = [], [], 0
-    LIMIT = 3500
-    for line in lines:
-        l = len(line) + 1
-        if block and cur_len + l > LIMIT:
-            content = "\n".join(block)
-            parts.append(f"<b>Помощь</b>\n<pre>{content}</pre>")
-            block = [line]; cur_len = l
-        else:
-            block.append(line); cur_len += l
-    if block:
-        content = "\n".join(block)
-        parts.append(f"<b>Помощь</b>\n<pre>{content}</pre>")
-    return parts
-
-async def send_help_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    for part in build_help_messages():
-        await context.bot.send_message(chat_id=chat_id, text=part, parse_mode="HTML")
-
-# ------------------ MAIN KEYBOARD ------------------
-def get_main_keyboard():
-    # Иконки через Unicode-эскейпы (надежно при любой кодировке файла)
-    E = {
-        "refresh": "\U0001F501",                # 🔁
-        "stats": "\U0001F4CA",                  # 📊
-        "tunnel": "\U0001F6E3\ufe0f",           # 🛣️
-        "traffic": "\U0001F4F6",                # 📶
-        "update": "\U0001F517",                 # 🔗
-        "cleanup": "\U0001F9F9",                # 🧹
-        "remote": "\U0001F310",                 # 🌐
-        "expiry": "\u23F3",                     # ⏳
-        "renew": "\u231B",                      # ⌛
-        "enable": "\u2705",                     # ✅
-        "disable": "\u26A0\ufe0f",              # ⚠️
-        "create": "\u2795",                     # ➕
-        "delete": "\U0001F5D1\ufe0f",           # 🗑️
-        "send": "\U0001F4E4",                   # 📤
-        "log": "\U0001F4DC",                    # 📜
-        "backup": "\U0001F4E6",                 # 📦
-        "restore": "\U0001F504",                # 🔄
-        "alert": "\U0001F6A8",                  # 🚨
-        "help": "\u2753",                       # ❓
-        "home": "\U0001F3E0",                   # 🏠
-    }
-    keyboard = [
-        [InlineKeyboardButton(f"{E['refresh']} Список клиентов", callback_data='refresh')],
-        [InlineKeyboardButton(f"{E['stats']} Статистика", callback_data='stats'),
-         InlineKeyboardButton(f"{E['tunnel']} Тунель", callback_data='send_ipp')],
-        [InlineKeyboardButton(f"{E['traffic']} Трафик", callback_data='traffic'),
-         InlineKeyboardButton(f"{E['update']} Обновление", callback_data='update_info')],
-        [InlineKeyboardButton(f"{E['cleanup']} Очистить трафик", callback_data='traffic_clear'),
-         InlineKeyboardButton(f"{E['remote']} Обновить адрес", callback_data='update_remote')],
-        [InlineKeyboardButton(f"{E['expiry']} Сроки ключей", callback_data='keys_expiry'),
-         InlineKeyboardButton(f"{E['renew']} Обновить ключ", callback_data='renew_key')],
-        [InlineKeyboardButton(f"{E['enable']} Вкл.клиента", callback_data='bulk_enable_start'),
-         InlineKeyboardButton(f"{E['disable']} Откл.клиента", callback_data='bulk_disable_start')],
-        [InlineKeyboardButton(f"{E['create']} Создать ключ", callback_data='create_key'),
-         InlineKeyboardButton(f"{E['delete']} Удалить ключ", callback_data='bulk_delete_start')],
-        [InlineKeyboardButton(f"{E['send']} Отправить ключи", callback_data='bulk_send_start'),
-         InlineKeyboardButton(f"{E['log']} Просмотр лога", callback_data='log')],
-        [InlineKeyboardButton(f"{E['backup']} Бэкап OpenVPN", callback_data='backup_menu'),
-         InlineKeyboardButton(f"{E['restore']} Восстан.бэкап", callback_data='restore_menu')],
-        [InlineKeyboardButton(f"{E['alert']} Тревога блокировки", callback_data='block_alert')],
-        [InlineKeyboardButton(f"{E['help']} Помощь", callback_data='help'),
-         InlineKeyboardButton(f"{E['home']} В главное меню", callback_data='home')],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-# ------------------ Генерация .ovpn (с поддержкой TLSv2) ------------------
+# ------------------ Генерация .ovpn ------------------
 def extract_pem_cert(cert_path: str) -> str:
     with open(cert_path, "r") as f:
         lines = f.read().splitlines()
@@ -1074,23 +558,6 @@ def extract_pem_cert(cert_path: str) -> str:
             break
     return "\n".join(out).strip()
 
-def _detect_tls_sig(server_conf_path=f"{OPENVPN_DIR}/server.conf") -> int:
-    # 3=tls-crypt-v2, 1=tls-crypt, 2=tls-auth, 0=none
-    TLS_SIG = 0
-    try:
-        if os.path.exists(server_conf_path):
-            with open(server_conf_path, "r") as f:
-                conf = f.read()
-                if "tls-crypt-v2" in conf:
-                    return 3
-                if "tls-crypt" in conf:
-                    return 1
-                if "tls-auth" in conf:
-                    return 2
-    except Exception:
-        pass
-    return TLS_SIG
-
 def generate_ovpn_for_client(
     client_name,
     output_dir=KEYS_DIR,
@@ -1100,7 +567,7 @@ def generate_ovpn_for_client(
     key_path=None,
     tls_crypt_path=f"{OPENVPN_DIR}/tls-crypt.key",
     tls_auth_path=f"{OPENVPN_DIR}/tls-auth.key",
-    server_conf_path=f"{OPENVPN_DIR}/server.conf"
+    server_conf_path=None
 ):
     if cert_path is None:
         cert_path = f"{EASYRSA_DIR}/pki/issued/{client_name}.crt"
@@ -1108,7 +575,7 @@ def generate_ovpn_for_client(
         key_path = f"{EASYRSA_DIR}/pki/private/{client_name}.key"
     ovpn_file = os.path.join(output_dir, f"{client_name}.ovpn")
 
-    TLS_SIG = _detect_tls_sig(server_conf_path)
+    TLS_SIG = _detect_tls_sig()
 
     with open(template_path, "r") as f:
         template_content = f.read().rstrip()
@@ -1130,7 +597,7 @@ def generate_ovpn_for_client(
                 tls_v2_content = f.read().strip()
             content += "<tls-crypt-v2>\n" + tls_v2_content + "\n</tls-crypt-v2>\n"
         else:
-            print(f"[tlsv2] клиентский ключ не найден для {client_name} (ok, если сервер использует общий ключ).")
+            print(f"[{_tz_now_str()}] [tlsv2] WARNING: no client key found for {client_name} — .ovpn без <tls-crypt-v2>")
     elif TLS_SIG == 1 and os.path.exists(tls_crypt_path):
         with open(tls_crypt_path, "r") as f:
             tls_crypt_content = f.read().strip()
@@ -1143,12 +610,13 @@ def generate_ovpn_for_client(
 
     with open(ovpn_file, "w") as f:
         f.write(content)
+    print(f"[{_tz_now_str()}] [ovpn] written {ovpn_file} (TLS_SIG={TLS_SIG})")
     return ovpn_file
 
-# ------------------ Создание ключей (как в «v1»: логические сроки + multi-create) ------------------
+# ------------------ Создание ключей ------------------
 async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Шаг 1: Имя клиента
-    if context.user_data.get('await_key_name'):
+    # Шаг 1: Имя
+    if get_flag(context, 'await_key_name'):
         key_name = update.message.text.strip()
         if not key_name:
             await update.message.reply_text("Имя пустое. Введите имя:")
@@ -1157,27 +625,27 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if os.path.exists(ovpn_file):
             await update.message.reply_text("Такой клиент существует, введите другое имя.")
             return
-        context.user_data['new_key_name'] = key_name
-        context.user_data['await_key_name'] = False
-        context.user_data['await_key_expiry'] = True
+        set_store(context, 'new_key_name', key_name)
+        clear_flag(context, 'await_key_name')
+        set_flag(context, 'await_key_expiry', True)
         await update.message.reply_text("Введите логический срок (дней, по умолчанию 30):")
         return
 
     # Шаг 2: Срок
-    if context.user_data.get('await_key_expiry'):
+    if get_flag(context, 'await_key_expiry'):
         try:
             days = int(update.message.text.strip())
             if days < 1: raise ValueError
         except:
             days = 30
-        context.user_data['new_key_expiry'] = days
-        context.user_data['await_key_expiry'] = False
-        context.user_data['await_key_quantity'] = True
+        set_store(context, 'new_key_expiry', days)
+        clear_flag(context, 'await_key_expiry')
+        set_flag(context, 'await_key_quantity', True)
         await update.message.reply_text("Введите количество ключей (по умолчанию 1):")
         return
 
     # Шаг 3: Количество
-    if context.user_data.get('await_key_quantity'):
+    if get_flag(context, 'await_key_quantity'):
         try:
             qty = int(update.message.text.strip())
             if qty < 1: raise ValueError
@@ -1186,30 +654,23 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if qty > 100:
             await update.message.reply_text("Слишком много. Максимум 100. Введите снова:")
             return
-        base = context.user_data.get('new_key_name')
-        days = context.user_data.get('new_key_expiry', 30)
+        base = get_store(context, 'new_key_name')
+        days = get_store(context, 'new_key_expiry', 30)
 
-        # Формируем список имён
-        if qty == 1:
-            names = [base]
-        else:
-            names = [base] + [f"{base}{i}" for i in range(2, qty + 1)]
-
-        # Проверка коллизий
+        names = [base] if qty == 1 else [base] + [f"{base}{i}" for i in range(2, qty + 1)]
         collisions = [n for n in names if os.path.exists(os.path.join(KEYS_DIR, f"{n}.ovpn"))]
         if collisions:
             await update.message.reply_text(
                 "Конфликт имён (существуют): " + ", ".join(collisions) +
-                "\nВведите другое базовое имя /start > Создать ключ"
+                "\nВведите другое базовое имя /start → Создать ключ"
             )
-            context.user_data.clear()
+            clear_store(context, 'new_key_name', 'new_key_expiry')
+            clear_flag(context, 'await_key_quantity')
             return
 
-        created = []
-        errors = []
+        created, errors = [], []
         for n in names:
             try:
-                # Генерим сертификат с «длинным» сроком, логический срок ведём отдельно
                 subprocess.run(
                     f"EASYRSA_CERT_EXPIRE=3650 {EASYRSA_DIR}/easyrsa --batch build-client-full {n} nopass",
                     shell=True, check=True, cwd=EASYRSA_DIR
@@ -1223,18 +684,12 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 errors.append(f"{n}: {e}")
 
         if created:
-            await update.message.reply_text(
-                f"Создано ключей: {len(created)} (срок ~{days} дн)", parse_mode="HTML"
-            )
+            await update.message.reply_text(f"Создано ключей: {len(created)} (срок ~{days} дн)", parse_mode="HTML")
             for (n, path, iso) in created:
                 try:
                     await update.message.reply_text(f"{n}: до {iso}\n{path}")
                     with open(path, "rb") as f:
-                        await context.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=InputFile(f),
-                            filename=f"{n}.ovpn"
-                        )
+                        await context.bot.send_document(chat_id=update.effective_chat.id, document=InputFile(f), filename=f"{n}.ovpn")
                 except Exception as e:
                     await update.message.reply_text(f"Ошибка отправки {n}: {e}")
         if errors:
@@ -1242,7 +697,8 @@ async def create_key_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             if len(errors) > 10: err_txt += f"\n... ещё {len(errors)-10}"
             await update.message.reply_text(f"Ошибки:\n{err_txt}")
 
-        context.user_data.clear()
+        clear_store(context, 'new_key_name', 'new_key_expiry')
+        clear_flag(context, 'await_key_quantity')
         return
 
 # ------------------ Renew (логический) ------------------
@@ -1255,43 +711,42 @@ async def renew_key_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await safe_edit_text(q, context, "Нет ключей."); return
     url = create_keys_detailed_page()
-    if not url:
-        await safe_edit_text(q, context, "Ошибка Telegraph."); return
     order = [r["name"] for r in rows]
-    context.user_data['renew_keys_order'] = order
-    context.user_data['await_renew_number'] = True
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_renew")]])
+    set_store(context, 'renew_keys_order', order)
+    set_flag(context, 'await_renew_number', True)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_renew")]])
     text = ("<b>Установить новый логический срок</b>\n"
             "Открой список и введи НОМЕР клиента:\n"
             f"<a href=\"{url}\">Список (Telegraph)</a>\n\nПример: 5")
     await safe_edit_text(q, context, text, parse_mode="HTML", reply_markup=kb)
 
 async def process_renew_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('await_renew_number'): return
+    if not get_flag(context, 'await_renew_number'): return
     text = update.message.text.strip()
     if not re.fullmatch(r"\d+", text):
         await update.message.reply_text("Нужно ввести один номер клиента.",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_renew")]]))
+                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_renew")]]))
         return
     idx = int(text)
-    order: List[str] = context.user_data.get('renew_keys_order', [])
+    order: List[str] = get_store(context, 'renew_keys_order', [])
     if not order:
         await update.message.reply_text("Список потерян. Начните заново.")
-        context.user_data.pop('await_renew_number', None); return
+        clear_flag(context, 'await_renew_number'); return
     if idx < 1 or idx > len(order):
         await update.message.reply_text(f"Номер вне диапазона 1..{len(order)}.",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("? Отмена", callback_data="cancel_renew")]]))
+                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_renew")]]))
         return
     key_name = order[idx - 1]
-    context.user_data['renew_key_name'] = key_name
-    context.user_data['await_renew_number'] = False
-    context.user_data['await_renew_expiry'] = True
+    set_store(context, 'renew_key_name', key_name)
+    clear_flag(context, 'await_renew_number')
+    set_flag(context, 'await_renew_expiry', True)
     await update.message.reply_text(f"Введите НОВЫЙ срок (дней) для {key_name}:")
 
 async def renew_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer("Отменено")
-    for k in ['await_renew_number', 'await_renew_expiry', 'renew_keys_order', 'renew_key_name']:
-        context.user_data.pop(k, None)
+    clear_flag(context, 'await_renew_number')
+    clear_flag(context, 'await_renew_expiry')
+    clear_store(context, 'renew_keys_order', 'renew_key_name')
     await safe_edit_text(q, context, "Продление отменено.")
 
 async def renew_key_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1301,13 +756,13 @@ async def renew_key_select_handler(update: Update, context: ContextTypes.DEFAULT
     await q.answer()
     data = q.data
     key_name = data.split('_', 1)[1]
-    context.user_data['renew_key_name'] = key_name
-    context.user_data['await_renew_expiry'] = True
+    set_store(context, 'renew_key_name', key_name)
+    set_flag(context, 'await_renew_expiry', True)
     await safe_edit_text(q, context, f"Введите НОВЫЙ срок (дней) для {key_name}:")
 
 async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get('await_renew_expiry'): return
-    key_name = context.user_data['renew_key_name']
+    if not get_flag(context, 'await_renew_expiry'): return
+    key_name = get_store(context, 'renew_key_name')
     try:
         days = int(update.message.text.strip())
         if days < 1: raise ValueError
@@ -1315,7 +770,8 @@ async def renew_key_expiry_handler(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Некорректное число дней."); return
     iso = set_client_expiry_days_from_now(key_name, days)
     await update.message.reply_text(f"Логический срок для {key_name} установлен до: {iso} (~{days} дн). Клиент разблокирован.")
-    context.user_data.clear()
+    clear_flag(context, 'await_renew_expiry')
+    clear_store(context, 'renew_key_name')
 
 # ------------------ Лог ------------------
 def get_status_log_tail(n=40):
@@ -1349,11 +805,11 @@ async def perform_backup_and_send(update: Update, context: ContextTypes.DEFAULT_
     try:
         path = create_backup_in_root_excluding_archives()
         size = os.path.getsize(path)
-        txt = f"? Бэкап создан: <code>{os.path.basename(path)}</code>\nРазмер: {size/1024/1024:.2f} MB"
+        txt = f"\U0001F4E6 Бэкап создан: <code>{os.path.basename(path)}</code>\nРазмер: {size/1024/1024:.2f} MB"
         q = update.callback_query
         await safe_edit_text(q, context, txt, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("?? Отправить", callback_data=f"backup_send_{os.path.basename(path)}")],
-            [InlineKeyboardButton("?? Список", callback_data="backup_list")],
+            [InlineKeyboardButton("\U0001F4E4 Отправить", callback_data=f"backup_send_{os.path.basename(path)}")],
+            [InlineKeyboardButton("\U0001F4E6 Список", callback_data="backup_list")],
         ]))
     except Exception as e:
         await update.callback_query.edit_message_text(f"Ошибка бэкапа: {e}")
@@ -1395,9 +851,9 @@ async def show_backup_info(update: Update, context: ContextTypes.DEFAULT_TYPE, f
                f"Файлов: {len(m.get('files', []))}\n"
                f"Клиентов V: {v_count} / R: {r_count}\nПоказать diff?")
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("?? Diff", callback_data=f"restore_dry_{fname}")],
-            [InlineKeyboardButton("?? Отправить", callback_data=f"backup_send_{fname}")],
-            [InlineKeyboardButton("??? Удалить", callback_data=f"backup_delete_{fname}")],
+            [InlineKeyboardButton("\U0001F9EA Diff", callback_data=f"restore_dry_{fname}")],
+            [InlineKeyboardButton("\U0001F4E4 Отправить", callback_data=f"backup_send_{fname}")],
+            [InlineKeyboardButton("\U0001F5D1\ufe0f Удалить", callback_data=f"backup_delete_{fname}")],
         ])
         await safe_edit_text(update.callback_query, context, txt, parse_mode="HTML", reply_markup=kb)
     finally:
@@ -1423,8 +879,8 @@ async def restore_dry_run(update: Update, context: ContextTypes.DEFAULT_TYPE, fn
                 f"Changed: {len(diff['changed'])}\n" + "\n".join(lim(diff['changed'])) + "\n\n"
                 "Применить restore?")
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("?? Применить", callback_data=f"restore_apply_{fname}")],
-            [InlineKeyboardButton("?? Назад", callback_data=f"backup_info_{fname}")]
+            [InlineKeyboardButton("\u26A0\ufe0f Применить", callback_data=f"restore_apply_{fname}")],
+            [InlineKeyboardButton("\u2B05\ufe0f Назад", callback_data=f"backup_info_{fname}")]
         ])
         await safe_edit_text(update.callback_query, context, text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
@@ -1458,8 +914,8 @@ async def backup_delete_prompt(update: Update, context: ContextTypes.DEFAULT_TYP
     if not os.path.exists(full):
         await safe_edit_text(update.callback_query, context, "Файл не найден."); return
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("? Да, удалить", callback_data=f"backup_delete_confirm_{fname}")],
-        [InlineKeyboardButton("?? Назад", callback_data=f"backup_info_{fname}")]
+        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"backup_delete_confirm_{fname}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"backup_info_{fname}")]
     ])
     await safe_edit_text(update.callback_query, context, f"Удалить бэкап <b>{fname}</b>?", parse_mode="HTML", reply_markup=kb)
 
@@ -1468,7 +924,7 @@ async def backup_delete_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         if os.path.exists(full):
             os.remove(full)
-            await safe_edit_text(update.callback_query, context, "??? Бэкап удалён.")
+            await safe_edit_text(update.callback_query, context, "🗑️ Бэкап удалён.")
             await show_backup_list(update, context)
         else:
             await safe_edit_text(update.callback_query, context, "Файл не найден.")
@@ -1478,15 +934,15 @@ async def backup_delete_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def backup_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("?? Создать бэкап", callback_data="backup_create")],
-        [InlineKeyboardButton("?? Список бэкапов", callback_data="backup_list")],
+        [InlineKeyboardButton("🆕 Создать бэкап", callback_data="backup_create")],
+        [InlineKeyboardButton("📦 Список бэкапов", callback_data="backup_list")],
     ])
     await safe_edit_text(q, context, "Меню бэкапов:", reply_markup=kb)
 
 async def restore_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("?? Список бэкапов", callback_data="backup_list")]])
-    await safe_edit_text(q, context, "Восстановление: выбери бэкап > Diff > Применить.", reply_markup=kb)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Список бэкапов", callback_data="backup_list")]])
+    await safe_edit_text(q, context, "Восстановление: выбери бэкап → Diff → Применить.", reply_markup=kb)
 
 # ------------------ Трафик ------------------
 def load_traffic_db():
@@ -1503,7 +959,7 @@ def load_traffic_db():
         else:
             traffic_usage = {}
     except Exception as e:
-        print(f"[traffic] load error: {e}")
+        print(f"[{_tz_now_str()}] [traffic] load error: {e}")
         traffic_usage = {}
 
 def save_traffic_db(force=False):
@@ -1516,7 +972,7 @@ def save_traffic_db(force=False):
         os.replace(tmp, TRAFFIC_DB_PATH)
         _last_traffic_save_time = now
     except Exception as e:
-        print(f"[traffic] save error: {e}")
+        print(f"[{_tz_now_str()}] [traffic] save error: {e}")
 
 def update_traffic_from_status(clients):
     global traffic_usage, _last_session_state
@@ -1586,11 +1042,11 @@ async def check_new_connections(app: Application):
             now = time.time()
             if online_count == 0 and total_keys > 0:
                 if now - last_alert_time > ALERT_INTERVAL_SEC:
-                    await app.bot.send_message(ADMIN_ID, "? Все клиенты оффлайн!", parse_mode="HTML")
+                    await app.bot.send_message(ADMIN_ID, "❌ Все клиенты оффлайн!", parse_mode="HTML")
                     last_alert_time = now
             elif 0 < online_count < MIN_ONLINE_ALERT:
                 if now - last_alert_time > ALERT_INTERVAL_SEC:
-                    await app.bot.send_message(ADMIN_ID, f"?? Онлайн мало: {online_count}/{total_keys}", parse_mode="HTML")
+                    await app.bot.send_message(ADMIN_ID, f"⚠️ Онлайн мало: {online_count}/{total_keys}", parse_mode="HTML")
                     last_alert_time = now
             else:
                 if online_count >= MIN_ONLINE_ALERT:
@@ -1598,7 +1054,7 @@ async def check_new_connections(app: Application):
             clients_last_online = set(online_names)
             await asyncio.sleep(10)
         except Exception as e:
-            print(f"[monitor] {e}")
+            print(f"[{_tz_now_str()}] [monitor] {e}")
             await asyncio.sleep(10)
 
 def parse_openvpn_status(status_path=STATUS_LOG):
@@ -1639,7 +1095,7 @@ def parse_openvpn_status(status_path=STATUS_LOG):
                     tunnel_ips[parts[1]] = parts[0]
                     online_names.add(parts[1])
     except Exception as e:
-        print(f"[parse_openvpn_status] {e}")
+        print(f"[{_tz_now_str()}] [parse_openvpn_status] {e}")
     return clients, online_names, tunnel_ips
 
 # ------------------ safe_edit_text ------------------
@@ -1649,30 +1105,108 @@ async def safe_edit_text(q, context, text, **kwargs):
     else:
         await q.edit_message_text(text, **kwargs)
 
-# ------------------ Универсальный текстовый ввод ------------------
+# ------------------ Универсальный текстовый ввод (с логами) ------------------
 async def universal_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    if context.user_data.get('await_bulk_delete_numbers'):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    txt = (update.message.text or "").strip()
+    print(f"[text] '{txt}' flags_user={list(context.user_data.keys())} flags_chat={list(context.chat_data.keys())}")
+
+    # 1) Нормальные флаги (если они на месте)
+    if get_flag(context, 'await_bulk_delete_numbers'):
         await process_bulk_delete_numbers(update, context); return
-    if context.user_data.get('await_bulk_send_numbers'):
+    if get_flag(context, 'await_bulk_send_numbers'):
         await process_bulk_send_numbers(update, context); return
-    if context.user_data.get('await_bulk_enable_numbers'):
+    if get_flag(context, 'await_bulk_enable_numbers'):
         await process_bulk_enable_numbers(update, context); return
-    if context.user_data.get('await_bulk_disable_numbers'):
+    if get_flag(context, 'await_bulk_disable_numbers'):
         await process_bulk_disable_numbers(update, context); return
-    if context.user_data.get('await_renew_number'):
+    if get_flag(context, 'await_renew_number'):
         await process_renew_number(update, context); return
-    if context.user_data.get('await_renew_expiry'):
+    if get_flag(context, 'await_renew_expiry'):
         await renew_key_expiry_handler(update, context); return
-    if (context.user_data.get('await_key_name') or
-        context.user_data.get('await_key_expiry') or
-        context.user_data.get('await_key_quantity')):
+    if (get_flag(context, 'await_key_name') or
+        get_flag(context, 'await_key_expiry') or
+        get_flag(context, 'await_key_quantity')):
         await create_key_handler(update, context); return
-    if context.user_data.get('await_remote_input'):
+    if get_flag(context, 'await_remote_input'):
         await process_remote_input(update, context); return
+
+    # 2) ХЕВРИСТИКА: если флаг потерялся, но есть сохранённые списки и текст похож на выбор,
+    #    восстанавливаем флаг на лету и обрабатываем.
+    import re as _re
+
+    def _looks_like_selection(s: str) -> bool:
+        # Поддержка: all | 1 | 1,2,5 | 3-7 | 1,2,5-9 | смешанные диапазоны
+        return bool(_re.fullmatch(r"(all|\d+|\d+(?:[,\s]+\d+)*|\d+-\d+(?:[,\s]+(?:\d+|\d+-\d+))*)", s.strip(), flags=_re.I))
+
+    if _looks_like_selection(txt):
+        if get_store(context, 'bulk_delete_keys', []):
+            set_flag(context, 'await_bulk_delete_numbers', True)
+            await process_bulk_delete_numbers(update, context); return
+        if get_store(context, 'bulk_send_keys', []):
+            set_flag(context, 'await_bulk_send_numbers', True)
+            await process_bulk_send_numbers(update, context); return
+        if get_store(context, 'bulk_enable_keys', []):
+            set_flag(context, 'await_bulk_enable_numbers', True)
+            await process_bulk_enable_numbers(update, context); return
+        if get_store(context, 'bulk_disable_keys', []):
+            set_flag(context, 'await_bulk_disable_numbers', True)
+            await process_bulk_disable_numbers(update, context); return
+        if get_store(context, 'renew_keys_order', []):
+            set_flag(context, 'await_renew_number', True)
+            await process_renew_number(update, context); return
+
     await update.message.reply_text("Неизвестный ввод. Используй меню или /start.")
 
 # ------------------ HELP / START / Прочие команды ------------------
+def get_main_keyboard():
+    E = {
+        "refresh": "\U0001F501",
+        "stats": "\U0001F4CA",
+        "tunnel": "\U0001F6E3\ufe0f",
+        "traffic": "\U0001F4F6",
+        "update": "\U0001F517",
+        "cleanup": "\U0001F9F9",
+        "remote": "\U0001F310",
+        "expiry": "\u23F3",
+        "renew": "\u231B",
+        "enable": "\u2705",
+        "disable": "\u26A0\ufe0f",
+        "create": "\u2795",
+        "delete": "\U0001F5D1\ufe0f",
+        "send": "\U0001F4E4",
+        "log": "\U0001F4DC",
+        "backup": "\U0001F4E6",
+        "restore": "\U0001F504",
+        "alert": "\U0001F6A8",
+        "help": "\u2753",
+        "home": "\U0001F3E0",
+    }
+    keyboard = [
+        [InlineKeyboardButton(f"{E['refresh']} Список клиентов", callback_data='refresh')],
+        [InlineKeyboardButton(f"{E['stats']} Статистика", callback_data='stats'),
+         InlineKeyboardButton(f"{E['tunnel']} Тунель", callback_data='send_ipp')],
+        [InlineKeyboardButton(f"{E['traffic']} Трафик", callback_data='traffic'),
+         InlineKeyboardButton(f"{E['update']} Обновление", callback_data='update_info')],
+        [InlineKeyboardButton(f"{E['cleanup']} Очистить трафик", callback_data='traffic_clear'),
+         InlineKeyboardButton(f"{E['remote']} Обновить адрес", callback_data='update_remote')],
+        [InlineKeyboardButton(f"{E['expiry']} Сроки ключей", callback_data='keys_expiry'),
+         InlineKeyboardButton(f"{E['renew']} Обновить ключ", callback_data='renew_key')],
+        [InlineKeyboardButton(f"{E['enable']} Вкл.клиента", callback_data='bulk_enable_start'),
+         InlineKeyboardButton(f"{E['disable']} Откл.клиента", callback_data='bulk_disable_start')],
+        [InlineKeyboardButton(f"{E['create']} Создать ключ", callback_data='create_key'),
+         InlineKeyboardButton(f"{E['delete']} Удалить ключ", callback_data='bulk_delete_start')],
+        [InlineKeyboardButton(f"{E['send']} Отправить ключи", callback_data='bulk_send_start'),
+         InlineKeyboardButton(f"{E['log']} Просмотр лога", callback_data='log')],
+        [InlineKeyboardButton(f"{E['backup']} Бэкап OpenVPN", callback_data='backup_menu'),
+         InlineKeyboardButton(f"{E['restore']} Восстан.бэкап", callback_data='restore_menu')],
+        [InlineKeyboardButton(f"{E['alert']} Тревога блокировки", callback_data='block_alert')],
+        [InlineKeyboardButton(f"{E['help']} Помощь", callback_data='help'),
+         InlineKeyboardButton(f"{E['home']} В главное меню", callback_data='home')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     global MENU_MESSAGE_ID, MENU_CHAT_ID
@@ -1686,7 +1220,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    await send_help_messages(context, update.effective_chat.id)
+    esc = escape(HELP_TEXT.strip("\n"))
+    parts = esc.splitlines()
+    LIMIT = 3500
+    block, cur_len = [], 0
+    for line in parts:
+        l = len(line) + 1
+        if block and cur_len + l > LIMIT:
+            content = "\n".join(block)
+            await update.message.reply_text(f"<b>Помощь</b>\n<pre>{content}</pre>", parse_mode="HTML")
+            block, cur_len = [line], l
+        else:
+            block.append(line); cur_len += l
+    if block:
+        content = "\n".join(block)
+        await update.message.reply_text(f"<b>Помощь</b>\n<pre>{content}</pre>", parse_mode="HTML")
 
 async def clients_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -1701,7 +1249,7 @@ async def cmd_backup_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     try:
         path = create_backup_in_root_excluding_archives()
-        await update.message.reply_text(f"? Бэкап: {os.path.basename(path)}")
+        await update.message.reply_text(f"📦 Бэкап: {os.path.basename(path)}")
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
@@ -1761,18 +1309,366 @@ async def view_keys_expiry_handler(update: Update, context: ContextTypes.DEFAULT
                 status = "нет срока"
             else:
                 if days_left is not None:
-                    if days_left < 0: status = f"? истёк ({iso})"
-                    elif days_left == 0: status = f"?? сегодня ({iso})"
+                    if days_left < 0: status = f"❌ истёк ({iso})"
+                    elif days_left == 0: status = f"⚠️ сегодня ({iso})"
                     else: status = f"{days_left}д (до {iso})"
                 else:
                     status = iso
-            mark = "?" if is_client_ccd_disabled(name) else "??"
+            mark = "⛔" if is_client_ccd_disabled(name) else "🟢"
             rows.append(f"{mark} {name}: {status}")
         text += "\n".join(rows)
     if update.callback_query:
         await safe_edit_text(update.callback_query, context, text, parse_mode="HTML")
     else:
         await update.message.reply_text(text, parse_mode="HTML")
+
+# ------------------ BULK: Delete/Send/Enable/Disable ------------------
+async def start_bulk_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    rows = gather_key_metadata()
+    if not rows:
+        await safe_edit_text(q, context, "Нет ключей."); return
+    url = create_keys_detailed_page()
+    keys_order = [r["name"] for r in rows]
+    set_store(context, 'bulk_delete_keys', keys_order)
+    set_flag(context, 'await_bulk_delete_numbers', True)
+    if url:
+        text = ("<b>Удаление ключей</b>\n"
+                "Формат: all | 1 | 1,2,5 | 3-7 | 1,2,5-9\n"
+                f"<a href=\"{url}\">Полный список</a>\n\nОтправьте строку с номерами.")
+    else:
+        fallback = _fallback_names_page(keys_order, "Удаление ключей", "Список ключей")
+        text = ("<b>Удаление ключей</b>\n"
+                "Telegraph недоступен — список ниже, вводите номера.\n\n<pre>" + escape(fallback) + "</pre>")
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_delete")]]))
+
+async def process_bulk_delete_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not get_flag(context, 'await_bulk_delete_numbers'): return
+    keys_order: List[str] = get_store(context, 'bulk_delete_keys', [])
+    if not keys_order:
+        await update.message.reply_text("Список потерян. Начните снова.")
+        clear_flag(context, 'await_bulk_delete_numbers'); return
+    idxs, errs = parse_bulk_selection(update.message.text.strip(), len(keys_order))
+    if errs or not idxs:
+        msg = "Ошибки:\n" + "\n".join(errs) if errs else "Ничего не выбрано."
+        await update.message.reply_text(msg,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_delete")]]))
+        return
+    selected_names = [keys_order[i - 1] for i in idxs]
+    set_store(context, 'bulk_delete_selected', selected_names)
+    clear_flag(context, 'await_bulk_delete_numbers')
+    preview = "\n".join(selected_names[:25]) + (f"\n... ещё {len(selected_names)-25}" if len(selected_names) > 25 else "")
+    await update.message.reply_text(
+        f"<b>Удалить ключи ({len(selected_names)}):</b>\n<code>{preview}</code>\nПодтвердить?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да", callback_data="bulk_delete_confirm")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_delete")]
+        ])
+    )
+
+async def bulk_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    selected: List[str] = get_store(context, 'bulk_delete_selected', [])
+    if not selected:
+        await safe_edit_text(q, context, "Пусто."); return
+    revoked, failed = revoke_and_collect(selected)
+    crl_status = generate_crl_once()
+    for name in revoked:
+        remove_client_files(name)
+        disconnect_client_sessions(name)
+    clear_store(context, 'bulk_delete_selected', 'bulk_delete_keys')
+    summary = (f"<b>Удаление завершено</b>\n"
+               f"Запрошено: {len(selected)}\nRevoked: {len(revoked)}\nОшибок: {len(failed)}\nCRL: {crl_status}")
+    if failed:
+        summary += "\n\n<b>Ошибки:</b>\n" + "\n".join(failed[:10])
+        if len(failed) > 10: summary += f"\n... ещё {len(failed)-10}"
+    await safe_edit_text(q, context, summary, parse_mode="HTML")
+
+async def bulk_delete_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer("Отменено")
+    clear_flag(context, 'await_bulk_delete_numbers')
+    clear_store(context, 'bulk_delete_selected', 'bulk_delete_keys')
+    await safe_edit_text(q, context, "Массовое удаление отменено.")
+
+async def start_bulk_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    files = get_ovpn_files()
+    files = sorted(files, key=lambda x: _natural_key(x[:-5]))
+    if not files:
+        await safe_edit_text(q, context, "Нет ключей."); return
+    names = [f[:-5] for f in files]
+    url, fallback = create_names_telegraph_page(names, "Отправка ключей", "Список ключей")
+    set_store(context, 'bulk_send_keys', names)
+    set_flag(context, 'await_bulk_send_numbers', True)
+    if url:
+        text = ("<b>Отправить ключи</b>\n"
+                "Формат: all | 1 | 1,2,5 | 3-7 | 1,2,5-9\n"
+                f"<a href=\"{url}\">Список</a>\n\nПришлите строку.")
+    else:
+        text = ("<b>Отправить ключи</b>\nTelegraph недоступен — список ниже.\n\n<pre>" + escape(fallback) + "</pre>")
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_send")]]))
+
+async def process_bulk_send_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not get_flag(context, 'await_bulk_send_numbers'): return
+    names: List[str] = get_store(context, 'bulk_send_keys', [])
+    if not names:
+        await update.message.reply_text("Список потерян. Начните заново.")
+        clear_flag(context, 'await_bulk_send_numbers'); return
+    idxs, errs = parse_bulk_selection(update.message.text.strip(), len(names))
+    if errs or not idxs:
+        msg = "Ошибки:\n" + "\n".join(errs) if errs else "Ничего не выбрано."
+        await update.message.reply_text(msg,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_send")]]))
+        return
+    selected = [names[i - 1] for i in idxs]
+    set_store(context, 'bulk_send_selected', selected)
+    clear_flag(context, 'await_bulk_send_numbers')
+    preview = "\n".join(selected[:25]) + (f"\n... ещё {len(selected)-25}" if len(selected) > 25 else "")
+    await update.message.reply_text(
+        f"<b>Отправить ({len(selected)}) ключей:</b>\n<code>{preview}</code>\nПодтвердить?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да", callback_data="bulk_send_confirm")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_send")]
+        ])
+    )
+
+async def bulk_send_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import asyncio
+    q = update.callback_query; await q.answer()
+    selected: List[str] = get_store(context, 'bulk_send_selected', [])
+    if not selected:
+        await safe_edit_text(q, context, "Список пуст."); return
+    await safe_edit_text(q, context, f"Отправляю {len(selected)} ключ(ов)...")
+    sent = 0
+    for name in selected:
+        path = os.path.join(KEYS_DIR, f"{name}.ovpn")
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    await context.bot.send_document(chat_id=q.message.chat_id, document=InputFile(f), filename=f"{name}.ovpn")
+                sent += 1
+                await asyncio.sleep(0.25)
+            except Exception as e:
+                print(f"[{_tz_now_str()}] [bulk_send] error {name}: {e}")
+    clear_store(context, 'bulk_send_selected', 'bulk_send_keys')
+    await context.bot.send_message(chat_id=q.message.chat_id, text=f"✅ Отправлено: {sent} / {len(selected)}")
+
+async def bulk_send_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer("Отменено")
+    clear_flag(context, 'await_bulk_send_numbers')
+    clear_store(context, 'bulk_send_selected', 'bulk_send_keys')
+    await safe_edit_text(q, context, "Массовая отправка отменена.")
+
+async def start_bulk_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    files = get_ovpn_files()
+    files = sorted(files, key=lambda x: _natural_key(x[:-5]))
+    disabled = [f[:-5] for f in files if is_client_ccd_disabled(f[:-5])]
+    if not disabled:
+        await safe_edit_text(q, context, "Нет заблокированных клиентов."); return
+    url, fallback = create_names_telegraph_page(disabled, "Включение клиентов", "Заблокированные клиенты")
+    set_store(context, 'bulk_enable_keys', disabled)
+    set_flag(context, 'await_bulk_enable_numbers', True)
+    if url:
+        text = ("<b>Включить клиентов</b>\n"
+                "Формат: all | 1 | 1,2 | 3-7 ...\n"
+                f"<a href=\"{url}\">Список</a>\n\nПришлите строку.")
+    else:
+        text = ("<b>Включить клиентов</b>\nTelegraph недоступен — список ниже.\n\n<pre>" + escape(fallback) + "</pre>")
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_enable")]]))
+
+async def process_bulk_enable_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not get_flag(context, 'await_bulk_enable_numbers'): return
+    names: List[str] = get_store(context, 'bulk_enable_keys', [])
+    if not names:
+        await update.message.reply_text("Список потерян.")
+        clear_flag(context, 'await_bulk_enable_numbers'); return
+    idxs, errs = parse_bulk_selection(update.message.text.strip(), len(names))
+    if errs or not idxs:
+        msg = "Ошибки:\n" + "\n".join(errs) if errs else "Ничего не выбрано."
+        await update.message.reply_text(msg,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_enable")]]))
+        return
+    selected = [names[i - 1] for i in idxs]
+    set_store(context, 'bulk_enable_selected', selected)
+    clear_flag(context, 'await_bulk_enable_numbers')
+    preview = "\n".join(selected[:30]) + (f"\n... ещё {len(selected)-30}" if len(selected) > 30 else "")
+    await update.message.reply_text(
+        f"<b>Включить ({len(selected)}):</b>\n<code>{preview}</code>\nПодтвердить?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да", callback_data="bulk_enable_confirm")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_enable")]
+        ])
+    )
+
+async def bulk_enable_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    selected: List[str] = get_store(context, 'bulk_enable_selected', [])
+    if not selected:
+        await safe_edit_text(q, context, "Пусто."); return
+    for name in selected:
+        unblock_client_ccd(name)
+    clear_store(context, 'bulk_enable_selected', 'bulk_enable_keys')
+    await safe_edit_text(q, context, f"✅ Включено клиентов: {len(selected)}")
+
+async def bulk_enable_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer("Отменено")
+    clear_flag(context, 'await_bulk_enable_numbers')
+    clear_store(context, 'bulk_enable_selected', 'bulk_enable_keys')
+    await safe_edit_text(q, context, "Массовое включение отменено.")
+
+async def start_bulk_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    files = get_ovpn_files()
+    files = sorted(files, key=lambda x: _natural_key(x[:-5]))
+    active = [f[:-5] for f in files if not is_client_ccd_disabled(f[:-5])]
+    if not active:
+        await safe_edit_text(q, context, "Нет активных клиентов."); return
+    url, fallback = create_names_telegraph_page(active, "Отключение клиентов", "Активные клиенты")
+    set_store(context, 'bulk_disable_keys', active)
+    set_flag(context, 'await_bulk_disable_numbers', True)
+    if url:
+        text = ("<b>Отключить клиентов</b>\n"
+                "Формат: all | 1 | 1,2,7 | 3-10 ...\n"
+                f"<a href=\"{url}\">Список</a>\n\nПришлите строку.")
+    else:
+        text = ("<b>Отключить клиентов</b>\nTelegraph недоступен — список ниже.\n\n<pre>" + escape(fallback) + "</pre>")
+    await safe_edit_text(q, context, text, parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_disable")]]))
+
+async def process_bulk_disable_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not get_flag(context, 'await_bulk_disable_numbers'): return
+    names: List[str] = get_store(context, 'bulk_disable_keys', [])
+    if not names:
+        await update.message.reply_text("Список потерян.")
+        clear_flag(context, 'await_bulk_disable_numbers'); return
+    idxs, errs = parse_bulk_selection(update.message.text.strip(), len(names))
+    if errs or not idxs:
+        msg = "Ошибки:\n" + "\n".join(errs) if errs else "Ничего не выбрано."
+        await update.message.reply_text(msg,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_disable")]]))
+        return
+    selected = [names[i - 1] for i in idxs]
+    set_store(context, 'bulk_disable_selected', selected)
+    clear_flag(context, 'await_bulk_disable_numbers')
+    preview = "\n".join(selected[:30]) + (f"\n... ещё {len(selected)-30}" if len(selected) > 30 else "")
+    await update.message.reply_text(
+        f"<b>Отключить ({len(selected)}):</b>\n<code>{preview}</code>\nПодтвердить?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да", callback_data="bulk_disable_confirm")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_bulk_disable")]
+        ])
+    )
+
+async def bulk_disable_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    selected: List[str] = get_store(context, 'bulk_disable_selected', [])
+    if not selected:
+        await safe_edit_text(q, context, "Пусто."); return
+    for name in selected:
+        block_client_ccd(name); disconnect_client_sessions(name)
+    clear_store(context, 'bulk_disable_selected', 'bulk_disable_keys')
+    await safe_edit_text(q, context, f"⚠️ Отключено клиентов: {len(selected)}")
+
+async def bulk_disable_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer("Отменено")
+    clear_flag(context, 'await_bulk_disable_numbers')
+    clear_store(context, 'bulk_disable_selected', 'bulk_disable_keys')
+    await safe_edit_text(q, context, "Массовое отключение отменено.")
+
+# ------------------ UPDATE REMOTE ------------------
+CLIENT_TEMPLATE_CANDIDATES = ["/etc/openvpn/client-template.txt", "/root/openvpn/client-template.txt"]
+def find_client_template_path() -> Optional[str]:
+    for p in CLIENT_TEMPLATE_CANDIDATES:
+        if os.path.exists(p): return p
+    return None
+
+def replace_remote_line_in_text(text: str, new_host: str, new_port: str) -> str:
+    lines = []; replaced = False
+    for line in text.splitlines():
+        if line.strip().startswith("remote "):
+            lines.append(f"remote {new_host} {new_port}"); replaced = True
+        else:
+            lines.append(line)
+    if not replaced:
+        lines.append(f"remote {new_host} {new_port}")
+    return "\n".join(lines) + "\n"
+
+def update_template_and_ovpn(new_host: str, new_port: str) -> Dict[str, int]:
+    stats = {"template_updated": 0, "ovpn_updated": 0, "errors": 0}
+    tpl = find_client_template_path()
+    if tpl:
+        try:
+            with open(tpl, "r") as f: old = f.read()
+            new = replace_remote_line_in_text(old, new_host, new_port)
+            if new != old:
+                backup = tpl + ".bak_" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                shutil.copy2(tpl, backup)
+                with open(tpl, "w") as f: f.write(new)
+                stats["template_updated"] = 1
+        except Exception as e:
+            print(f"[{_tz_now_str()}] [update_remote] template error: {e}"); stats["errors"] += 1
+    else:
+        print(f"[{_tz_now_str()}] [update_remote] template not found")
+    for f in get_ovpn_files():
+        path = os.path.join(KEYS_DIR, f)
+        try:
+            with open(path, "r") as fr: oldc = fr.read()
+            newc = replace_remote_line_in_text(oldc, new_host, new_port)
+            if newc != oldc:
+                bak = path + ".bak_" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                shutil.copy2(path, bak)
+                with open(path, "w") as fw: fw.write(newc)
+                stats["ovpn_updated"] += 1
+        except Exception as e:
+            print(f"[{_tz_now_str()}] [update_remote] file {f} error: {e}"); stats["errors"] += 1
+    return stats
+
+async def start_update_remote_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    tpl = find_client_template_path()
+    tpl_info = tpl if tpl else "не найден"
+    text = ("Введите новый remote в формате host:port\n"
+            f"(Обнаруженный шаблон: {tpl_info})\nПример: vpn.example.com:1194")
+    await safe_edit_text(q, context, text,
+                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="cancel_update_remote")]]))
+    set_flag(context, 'await_remote_input', True)
+
+async def process_remote_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not get_flag(context, 'await_remote_input'): return
+    raw = update.message.text.strip()
+    if ':' not in raw:
+        await update.message.reply_text("Формат неверный. Нужно host:port. Пример: myvpn.com:1194"); return
+    host, port = raw.split(':', 1)
+    host, port = host.strip(), port.strip()
+    if not host or not port.isdigit():
+        await update.message.reply_text("Некорректные host или port."); return
+    stats = update_template_and_ovpn(host, port)
+    clear_flag(context, 'await_remote_input')
+    await update.message.reply_text(
+        f"✅ Обновление завершено.\nШаблон: {stats['template_updated']}\n.ovpn изменено: {stats['ovpn_updated']}\nОшибок: {stats['errors']}"
+    )
+
+# ------------------ HELP TEXT ------------------
+HELP_TEXT = """❓ Справка
+
+• Список / Статистика ключей
+• Создание/Удаление/Отправка/Блокировка/Включение
+• Логические сроки (продлевай через «⌛ Обновить ключ»)
+• Трафик и очистка
+• Бэкап/восстановление
+• Обновление remote
+• Мониторинг подключений/блокировки
+
+На этом сервере используется TLS-Crypt v2: .ovpn включает <tls-crypt-v2> блок автоматически.
+"""
 
 # ------------------ BUTTON HANDLER ------------------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1781,140 +1677,170 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Доступ запрещён.", show_alert=True); return
     await q.answer()
     data = q.data
+    try:
+        if data == 'refresh':
+            await safe_edit_text(q, context, format_clients_by_certs(), parse_mode="HTML")
 
-    if data == 'refresh':
-        await safe_edit_text(q, context, format_clients_by_certs(), parse_mode="HTML")
+        elif data == 'stats':
+            clients, online_names, tunnel_ips = parse_openvpn_status()
+            files = get_ovpn_files()
+            files = sorted(files, key=lambda x: _natural_key(x[:-5]))
+            lines = ["<b>Статус всех ключей:</b>"]
+            for f in files:
+                name = f[:-5]
+                st = "⛔" if is_client_ccd_disabled(name) else ("🟢" if name in online_names else "🔴")
+                lines.append(f"{st} {name}")
+            text = "\n".join(lines)
+            msgs = split_message(text)
+            await safe_edit_text(q, context, msgs[0], parse_mode="HTML")
+            for m in msgs[1:]:
+                await context.bot.send_message(chat_id=q.message.chat_id, text=m, parse_mode="HTML")
 
-    elif data == 'stats':
-        clients, online_names, tunnel_ips = parse_openvpn_status()
-        files = get_ovpn_files()
-        files = sorted(files, key=lambda x: _natural_key(x[:-5]))
-        lines = ["<b>Статус всех ключей:</b>"]
-        for f in files:
-            name = f[:-5]
-            st = "?" if is_client_ccd_disabled(name) else ("??" if name in online_names else "??")
-            lines.append(f"{st} {name}")
-        text = "\n".join(lines)
-        msgs = split_message(text)
-        await safe_edit_text(q, context, msgs[0], parse_mode="HTML")
-        for m in msgs[1:]:
-            await context.bot.send_message(chat_id=q.message.chat_id, text=m, parse_mode="HTML")
+        elif data == 'traffic':
+            save_traffic_db(force=True)
+            await safe_edit_text(q, context, build_traffic_report(), parse_mode="HTML")
 
-    elif data == 'traffic':
-        save_traffic_db(force=True)
-        await safe_edit_text(q, context, build_traffic_report(), parse_mode="HTML")
+        elif data == 'traffic_clear':
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Да", callback_data="confirm_clear_traffic")],
+                [InlineKeyboardButton("❌ Нет", callback_data="cancel_clear_traffic")]
+            ])
+            await safe_edit_text(q, context, "Очистить накопленный трафик?", reply_markup=kb)
+        elif data == 'confirm_clear_traffic':
+            clear_traffic_stats(); await safe_edit_text(q, context, "Очищено.")
+        elif data == 'cancel_clear_traffic':
+            await safe_edit_text(q, context, "Отменено.")
 
-    elif data == 'traffic_clear':
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("? Да", callback_data="confirm_clear_traffic")],
-            [InlineKeyboardButton("? Нет", callback_data="cancel_clear_traffic")]
-        ])
-        await safe_edit_text(q, context, "Очистить накопленный трафик?", reply_markup=kb)
+        elif data == 'update_remote':
+            await start_update_remote_dialog(update, context)
+        elif data == 'cancel_update_remote':
+            clear_flag(context, 'await_remote_input')
+            await safe_edit_text(q, context, "Отменено.")
 
-    elif data == 'confirm_clear_traffic':
-        clear_traffic_stats(); await safe_edit_text(q, context, "Очищено.")
-    elif data == 'cancel_clear_traffic':
-        await safe_edit_text(q, context, "Отменено.")
+        elif data == 'renew_key':
+            await renew_key_request(update, context)
+        elif data.startswith('renew_'):
+            await renew_key_select_handler(update, context)
+        elif data == 'cancel_renew':
+            await renew_cancel(update, context)
 
-    elif data == 'update_remote':
-        await start_update_remote_dialog(update, context)
-    elif data == 'cancel_update_remote':
-        context.user_data.pop('await_remote_input', None); await safe_edit_text(q, context, "Отменено.")
+        elif data == 'backup_menu':
+            await backup_menu(update, context)
+        elif data == 'restore_menu':
+            await restore_menu(update, context)
+        elif data == 'backup_create':
+            await perform_backup_and_send(update, context)
+        elif data == 'backup_list':
+            await show_backup_list(update, context)
+        elif data.startswith('backup_info_'):
+            await show_backup_info(update, context, data.replace('backup_info_', '', 1))
+        elif data.startswith('backup_send_'):
+            await send_backup_file(update, context, data.replace('backup_send_', '', 1))
+        elif data.startswith('restore_dry_'):
+            await restore_dry_run(update, context, data.replace('restore_dry_', '', 1))
+        elif data.startswith('restore_apply_'):
+            await restore_apply(update, context, data.replace('restore_apply_', '', 1))
+        elif data.startswith('backup_delete_confirm_'):
+            await backup_delete_apply(update, context, data.replace('backup_delete_confirm_', '', 1))
+        elif data.startswith('backup_delete_'):
+            await backup_delete_prompt(update, context, data.replace('backup_delete_', '', 1))
 
-    elif data == 'renew_key':
-        await renew_key_request(update, context)
-    elif data.startswith('renew_'):
-        await renew_key_select_handler(update, context)
-    elif data == 'cancel_renew':
-        await renew_cancel(update, context)
+        elif data == 'bulk_delete_start':
+            await start_bulk_delete(update, context)
+        elif data == 'bulk_delete_confirm':
+            await bulk_delete_confirm(update, context)
+        elif data == 'cancel_bulk_delete':
+            await bulk_delete_cancel(update, context)
 
-    elif data == 'backup_menu':
-        await backup_menu(update, context)
-    elif data == 'restore_menu':
-        await restore_menu(update, context)
-    elif data == 'backup_create':
-        await perform_backup_and_send(update, context)
-    elif data == 'backup_list':
-        await show_backup_list(update, context)
-    elif data.startswith('backup_info_'):
-        await show_backup_info(update, context, data.replace('backup_info_', '', 1))
-    elif data.startswith('backup_send_'):
-        await send_backup_file(update, context, data.replace('backup_send_', '', 1))
-    elif data.startswith('restore_dry_'):
-        await restore_dry_run(update, context, data.replace('restore_dry_', '', 1))
-    elif data.startswith('restore_apply_'):
-        await restore_apply(update, context, data.replace('restore_apply_', '', 1))
-    elif data.startswith('backup_delete_confirm_'):
-        await backup_delete_apply(update, context, data.replace('backup_delete_confirm_', '', 1))
-    elif data.startswith('backup_delete_'):
-        await backup_delete_prompt(update, context, data.replace('backup_delete_', '', 1))
+        elif data == 'bulk_send_start':
+            await start_bulk_send(update, context)
+        elif data == 'bulk_send_confirm':
+            await bulk_send_confirm(update, context)
+        elif data == 'cancel_bulk_send':
+            await bulk_send_cancel(update, context)
 
-    elif data == 'bulk_delete_start':
-        await start_bulk_delete(update, context)
-    elif data == 'bulk_delete_confirm':
-        await bulk_delete_confirm(update, context)
-    elif data == 'cancel_bulk_delete':
-        await bulk_delete_cancel(update, context)
+        elif data == 'bulk_enable_start':
+            await start_bulk_enable(update, context)
+        elif data == 'bulk_enable_confirm':
+            await bulk_enable_confirm(update, context)
+        elif data == 'cancel_bulk_enable':
+            await bulk_enable_cancel(update, context)
 
-    elif data == 'bulk_send_start':
-        await start_bulk_send(update, context)
-    elif data == 'bulk_send_confirm':
-        await bulk_send_confirm(update, context)
-    elif data == 'cancel_bulk_send':
-        await bulk_send_cancel(update, context)
+        elif data == 'bulk_disable_start':
+            await start_bulk_disable(update, context)
+        elif data == 'bulk_disable_confirm':
+            await bulk_disable_confirm(update, context)
+        elif data == 'cancel_bulk_disable':
+            await bulk_disable_cancel(update, context)
 
-    elif data == 'bulk_enable_start':
-        await start_bulk_enable(update, context)
-    elif data == 'bulk_enable_confirm':
-        await bulk_enable_confirm(update, context)
-    elif data == 'cancel_bulk_enable':
-        await bulk_enable_cancel(update, context)
+        elif data == 'update_info':
+            await send_simple_update_command(update, context)
+        elif data == 'copy_update_cmd':
+            await resend_update_command(update, context)
 
-    elif data == 'bulk_disable_start':
-        await start_bulk_disable(update, context)
-    elif data == 'bulk_disable_confirm':
-        await bulk_disable_confirm(update, context)
-    elif data == 'cancel_bulk_disable':
-        await bulk_disable_cancel(update, context)
+        elif data == 'keys_expiry':
+            await view_keys_expiry_handler(update, context)
 
-    elif data == 'update_info':
-        await send_simple_update_command(update, context)
-    elif data == 'copy_update_cmd':
-        await resend_update_command(update, context)
+        elif data == 'send_ipp':
+            ipp_path = "/etc/openvpn/ipp.txt"
+            if os.path.exists(ipp_path):
+                with open(ipp_path, "rb") as f:
+                    await context.bot.send_document(chat_id=q.message.chat_id, document=InputFile(f), filename="ipp.txt")
+                await safe_edit_text(q, context, "ipp.txt отправлен.")
+            else:
+                await safe_edit_text(q, context, "ipp.txt не найден.")
 
-    elif data == 'keys_expiry':
-        await view_keys_expiry_handler(update, context)
+        elif data == 'block_alert':
+            await safe_edit_text(q, context,
+                                 "🔔 Мониторинг блокировки включен.\n"
+                                 f"Порог MIN_ONLINE_ALERT = {MIN_ONLINE_ALERT}\n"
+                                 "Оповещения если:\n • Все клиенты оффлайн\n • Онлайн меньше порога\n"
+                                 "Проверка каждые 10с. Истечения — каждые 12ч.")
 
-    elif data == 'send_ipp':
-        ipp_path = "/etc/openvpn/ipp.txt"
-        if os.path.exists(ipp_path):
-            with open(ipp_path, "rb") as f:
-                await context.bot.send_document(chat_id=q.message.chat_id, document=InputFile(f), filename="ipp.txt")
-            await safe_edit_text(q, context, "ipp.txt отправлен.")
+        elif data == 'help':
+            await send_help_messages(context, q.message.chat_id)
+
+        elif data == 'log':
+            await log_request(update, context)
+
+        elif data == 'create_key':
+            await safe_edit_text(q, context, "Введите имя нового клиента:")
+            set_flag(context, 'await_key_name', True)
+
+        elif data == 'home':
+            await context.bot.send_message(q.message.chat_id, "Главное меню уже показано. Для обновления нажми /start.")
         else:
-            await safe_edit_text(q, context, "ipp.txt не найден.")
+            await safe_edit_text(q, context, "Неизвестная команда.")
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[{_tz_now_str()}] [button_handler] error for '{data}': {e}\n{tb}")
+        try:
+            await context.bot.send_message(chat_id=q.message.chat_id, text=f"Ошибка обработчика: {e}")
+        except:
+            pass
 
-    elif data == 'block_alert':
-        await safe_edit_text(q, context,
-                             "?? Мониторинг блокировки включен.\n"
-                             f"Порог MIN_ONLINE_ALERT = {MIN_ONLINE_ALERT}\n"
-                             "Оповещения если:\n • Все клиенты оффлайн\n • Онлайн меньше порога\n"
-                             "Проверка каждые 10с. Истечения — каждые 12ч.")
+# ------------------ HELP SENDER ------------------
+def build_help_messages():
+    esc = escape(HELP_TEXT.strip("\n"))
+    lines = esc.splitlines()
+    parts, block, cur_len = [], [], 0
+    LIMIT = 3500
+    for line in lines:
+        l = len(line) + 1
+        if block and cur_len + l > LIMIT:
+            content = "\n".join(block)
+            parts.append(f"<b>Помощь</b>\n<pre>{content}</pre>")
+            block = [line]; cur_len = l
+        else:
+            block.append(line); cur_len += l
+    if block:
+        content = "\n".join(block)
+        parts.append(f"<b>Помощь</b>\n<pre>{content}</pre>")
+    return parts
 
-    elif data == 'help':
-        await send_help_messages(context, q.message.chat_id)
-
-    elif data == 'log':
-        await log_request(update, context)
-
-    elif data == 'create_key':
-        await safe_edit_text(q, context, "Введите имя нового клиента:")
-        context.user_data['await_key_name'] = True
-
-    elif data == 'home':
-        await context.bot.send_message(q.message.chat_id, "Главное меню уже показано. Для обновления нажми /start.")
-    else:
-        await safe_edit_text(q, context, "Неизвестная команда.")
+async def send_help_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    for part in build_help_messages():
+        await context.bot.send_message(chat_id=chat_id, text=part, parse_mode="HTML")
 
 # ------------------ MAIN ------------------
 def main():
