@@ -54,7 +54,7 @@ except Exception:
         raise RuntimeError("backup_restore.py не найден")
 
 BOT_VERSION = "2025-10-16-tlsv2-autodetect+tg-fallback+robust-input"
-UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot/main/openvpn_monitor_bot.py"
+UPDATE_SOURCE_URL = "https://raw.githubusercontent.com/XSFORM/update_bot_2/main/openvpn_monitor_bot.py"
 SIMPLE_UPDATE_CMD = (
     "curl -L -o /root/monitor_bot/openvpn_monitor_bot.py "
     f"{UPDATE_SOURCE_URL} && systemctl restart vpn_bot.service"
