@@ -1,66 +1,29 @@
 # OpenVpnTLS2
 
-## Быстрый старт: OpenVPN-сервер + Telegram-монитор-бот
+## Установка (одной командой)
 
-Этот проект помогает развернуть современный OpenVPN-сервер и Telegram-бота для его мониторинга и управления.
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/XSFORM/OpenVpnTLS2/main/bootstrap.sh)
+```
 
----
+Скрипт:
+- установит curl/git (если нет),
+- клонирует/обновит репозиторий в `/root/OpenVpnTLS2`,
+- запустит `install.sh` (доустановит зависимости, настроит сервис бота),
+- создаст ярлык `/root/openvpn-install.sh` и команду `openvpn-install`.
 
-## Установка
+По ходу установки вас попросят:
+- ввести Telegram BOT TOKEN,
+- ввести ваш Telegram ID.
 
-1. **Клонируйте репозиторий:**
-   ```bash
-   git clone https://github.com/XSFORM/OpenVpnTLS2.git
-   cd OpenVpnTLS2
-   ```
-
-2. **Дайте права на запуск:**
-   ```bash
-   chmod +x install.sh openvpn-install.sh
-   ```
-
-3. **Запустите установку:**
-   ```bash
-   ./install.sh
-   ```
-
-4. **Следуйте инструкции:**
-   - Введите токен Telegram-бота.
-   - Введите свой Telegram ID.
-
-5. **После завершения установки ОБЯЗАТЕЛЬНО перезапустите терминал.**
-
----
+Логи бота:
+```bash
+journalctl -u vpn_bot.service -f
+```
 
 ## Управление OpenVPN
 
-Для создания, удаления и управления VPN-клиентами используйте:
-```bash
-./openvpn-install.sh
-```
-(Скрипт будет доступен из `/root` — можно запускать из любой директории, если перейти в `/root`, либо прямо из вашей домашней папки root.)
+- Мастер-скрипт: `/root/openvpn-install.sh`
+- Или из любой директории: `openvpn-install`
 
----
-
-## Telegram-бот
-
-- Бот запускается как systemd-сервис и работает автоматически.
-- Для управления сервисом:
-  ```bash
-  systemctl restart vpn_bot.service
-  systemctl status vpn_bot.service
-  ```
-
----
-
-## Прочее
-
-- Ваши токены и ID хранятся только в `/root/monitor_bot/config.py` и не попадают в репозиторий.
-- Для обновления — просто скачайте новую версию репозитория, повторите установку, ваши ключи сохранятся.
-
----
-
-## Автор
-
-XSFORM  
-Telegram: [@XSFORM](https://t.me/XS_FORM)
+> Если у вас есть свой инсталлятор OpenVPN (`install_openvpn_xormask.sh`) — положите его рядом и запустите установку. Если файла нет, будут установлены `openvpn` и `easy-rsa` из репозиториев, создан базовый `client-template.txt` (серверный `server.conf` автоматически не генерируется).

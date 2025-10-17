@@ -1,12 +1,16 @@
 [Unit]
 Description=VPN Telegram Monitor Bot
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
+Type=simple
 User=root
 WorkingDirectory=/root/monitor_bot
 ExecStart=/usr/bin/python3 /root/monitor_bot/openvpn_monitor_bot.py
 Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
