@@ -1398,6 +1398,47 @@ def remove_client_files(name: str):
         except Exception as e:
             print(f"[remove_files] {name}: {p}: {e}")
 
+# ------------------ Server port update + restart helpers ------------------
+def _replace_port_line(text: str, new_port: str) -> str:
+    import re as _re
+    pattern = _re.compile(r"^\s*port\s+\d+\s*$", flags=_re.IGNORECASE | _re.MULTILINE)
+    if pattern.search(text):
+        return pattern.sub(f"port {new_port}", text)
+    return f"port {new_port}\n" + text
+
+def update_server_conf_port(new_port: str) -> dict:
+    stats = {"updated": 0, "errors": 0, "paths": []}
+    candidates = ["/etc/openvpn/server.conf", "/etc/openvpn/server/server.conf"]
+    for p in candidates:
+        try:
+            if not os.path.exists(p):
+                continue
+            with open(p, "r") as f:
+                old = f.read()
+            new = _replace_port_line(old, str(new_port))
+            if new != old:
+                bak = p + ".bak_" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                shutil.copy2(p, bak)
+                with open(p, "w") as f:
+                    f.write(new)
+                stats["updated"] += 1
+                stats["paths"].append(p)
+        except Exception as e:
+            stats["errors"] += 1
+            print(f"[update_server_conf_port] {p}: {e}")
+    return stats
+
+def restart_openvpn_service() -> str:
+    names = ["openvpn", "openvpn-server@server", "openvpn@server", "openvpn-server"]
+    for n in names:
+        try:
+            r = subprocess.run(f"systemctl try-reload-or-restart {n}", shell=True)
+            if r.returncode == 0:
+                return f"{n}: ok"
+        except Exception:
+            pass
+    return "не удалось (нет подходящего systemd-сервиса)"
+
 # ------------------ BULK: Delete/Send/Enable/Disable ------------------
 async def start_bulk_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -1727,6 +1768,8 @@ async def process_remote_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if not host or not port.isdigit():
         await update.message.reply_text("Некорректные host или port."); return
     stats = update_template_and_ovpn(host, port)
+    srv = update_server_conf_port(port)
+    svc = restart_openvpn_service()
     clear_flag(context, 'await_remote_input')
     await update.message.reply_text(
         f"✅ Обновление завершено.\nШаблон: {stats['template_updated']}\n.ovpn изменено: {stats['ovpn_updated']}\nОшибок: {stats['errors']}"
@@ -1941,3 +1984,43 @@ def main():
 
 if __name__ == '__main__':
     main()
+# ------------------ Server port update + restart helpers ------------------
+def _replace_port_line(text: str, new_port: str) -> str:
+    import re as _re
+    pattern = _re.compile(r'^\s*port\s+\d+\s*$', flags=_re.IGNORECASE | _re.MULTILINE)
+    if pattern.search(text):
+        return pattern.sub(f'port {new_port}', text)
+    return f'port {new_port}\n' + text
+
+def update_server_conf_port(new_port: str) -> dict:
+    stats = {"updated": 0, "errors": 0, "paths": []}
+    candidates = ["/etc/openvpn/server.conf", "/etc/openvpn/server/server.conf"]
+    for p in candidates:
+        try:
+            if not os.path.exists(p):
+                continue
+            with open(p, "r") as f:
+                old = f.read()
+            new = _replace_port_line(old, str(new_port))
+            if new != old:
+                bak = p + ".bak_" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                shutil.copy2(p, bak)
+                with open(p, "w") as f:
+                    f.write(new)
+                stats["updated"] += 1
+                stats["paths"].append(p)
+        except Exception as e:
+            stats["errors"] += 1
+            print(f"[update_server_conf_port] {p}: {e}")
+    return stats
+
+def restart_openvpn_service() -> str:
+    names = ["openvpn", "openvpn-server@server", "openvpn@server", "openvpn-server"]
+    for n in names:
+        try:
+            r = subprocess.run(f"systemctl try-reload-or-restart {n}", shell=True)
+            if r.returncode == 0:
+                return f"{n}: ok"
+        except Exception:
+            pass
+    return "не удалось (нет подходящего systemd-сервиса)"
