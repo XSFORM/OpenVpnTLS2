@@ -1322,6 +1322,82 @@ async def view_keys_expiry_handler(update: Update, context: ContextTypes.DEFAULT
     else:
         await update.message.reply_text(text, parse_mode="HTML")
 
+# ------------------ Парсер множественного выбора ------------------
+def parse_bulk_selection(text: str, max_index: int):
+    text = (text or "").strip().lower()
+    if not text:
+        return [], ["Пустой ввод."]
+    if text == "all":
+        return list(range(1, max_index + 1)), []
+    import re as _re
+    parts = _re.split(r"[,\s]+", text)
+    chosen = set()
+    errors = []
+    for p in parts:
+        if not p:
+            continue
+        if _re.fullmatch(r"\d+", p):
+            idx = int(p)
+            if 1 <= idx <= max_index:
+                chosen.add(idx)
+            else:
+                errors.append(f"Число вне диапазона: {p}")
+        elif _re.fullmatch(r"\d+-\d+", p):
+            a, b = p.split("-", 1)
+            a, b = int(a), int(b)
+            if a > b:
+                a, b = b, a
+            if a < 1 or b > max_index:
+                errors.append(f"Диапазон вне диапазона: {p}")
+            else:
+                for i in range(a, b + 1):
+                    chosen.add(i)
+        else:
+            errors.append(f"Неверный фрагмент: {p}")
+    return sorted(chosen), errors
+
+# ------------------ Удаление/CRL helpers ------------------
+from typing import List
+
+def revoke_and_collect(names: List[str]):
+    revoked, failed = [], []
+    for name in names:
+        try:
+            subprocess.run(f"{EASYRSA_DIR}/easyrsa --batch revoke {name}", shell=True, check=True, cwd=EASYRSA_DIR)
+            revoked.append(name)
+        except subprocess.CalledProcessError as e:
+            failed.append(f"{name}: {e}")
+        except Exception as e:
+            failed.append(f"{name}: {e}")
+    return revoked, failed
+
+def generate_crl_once() -> str:
+    try:
+        subprocess.run(f"{EASYRSA_DIR}/easyrsa gen-crl", shell=True, check=True, cwd=EASYRSA_DIR)
+        src = os.path.join(EASYRSA_DIR, "pki", "crl.pem")
+        dst = os.path.join(OPENVPN_DIR, "crl.pem")
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            os.chmod(dst, 0o644)
+            return "crl.pem обновлён"
+        return "crl.pem не найден после gen-crl"
+    except Exception as e:
+        return f"gen-crl ошибка: {e}"
+
+def remove_client_files(name: str):
+    paths = [
+        os.path.join(KEYS_DIR, f"{name}.ovpn"),
+        os.path.join(EASYRSA_DIR, "pki", "issued", f"{name}.crt"),
+        os.path.join(EASYRSA_DIR, "pki", "reqs", f"{name}.req"),
+        os.path.join(EASYRSA_DIR, "pki", "private", f"{name}.key"),
+        os.path.join(CCD_DIR, name),
+    ]
+    for p in paths:
+        try:
+            if os.path.exists(p): os.remove(p)
+        except Exception as e:
+            print(f"[remove_files] {name}: {p}: {e}")
+
 # ------------------ BULK: Delete/Send/Enable/Disable ------------------
 async def start_bulk_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
